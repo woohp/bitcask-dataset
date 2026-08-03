@@ -1,3 +1,4 @@
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,16 @@ def test_reopen(tmp_path: Path) -> None:
     reopened = BitcaskDataset(path)
     assert bytes(reopened[b"key"]) == b"value"
     assert bytes(reopened.key_at(0)) == b"key"
+
+
+def test_pickle_reopens_dataset(tmp_path: Path) -> None:
+    dataset = BitcaskDataset(tmp_path / "data")
+    dataset.extend([(b"key", b"value")])
+
+    reopened = pickle.loads(pickle.dumps(dataset))
+
+    assert reopened.path == dataset.path
+    assert bytes(reopened[b"key"]) == b"value"
 
 
 def test_extend_uses_new_shards(tmp_path: Path) -> None:

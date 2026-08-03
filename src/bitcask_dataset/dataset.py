@@ -81,6 +81,13 @@ class BitcaskDataset:
         """Return a key by insertion position."""
         return self._key_at(self._normalize_index(index))
 
+    def __getstate__(self) -> Path:
+        return self.path
+
+    def __setstate__(self, path: Path) -> None:
+        self.path = path
+        self._load()
+
     def _load(self) -> None:
         index_path = self.path / "index.bin"
         if index_path.stat().st_size:
