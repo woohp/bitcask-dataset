@@ -54,14 +54,18 @@ def test_keyless_dataset(tmp_path: Path) -> None:
 
     reopened = BitcaskDataset(path, keyed=False)
     assert bytes(reopened.at(1)) == b"beta"
-    assert pickle.loads(pickle.dumps(reopened)).keyed is False
+    unpickled = pickle.loads(pickle.dumps(reopened))
+    assert unpickled.keyed is False
+    assert unpickled.compression == "lz4"
 
     sizes = np.fromfile(path / "index.bin", dtype="<u4")
-    np.testing.assert_array_equal(sizes, [5, 4, 0])
+    assert sizes[0] != 5
+    assert sizes[1] != 4
+    assert sizes[2] == 0
 
 
 def test_extend_uses_new_shards(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
     dataset.extend([(b"a", b"1")], max_shard_size=10)
     dataset.extend([(b"b", b"2")], max_shard_size=10)
 
@@ -74,7 +78,7 @@ def test_extend_uses_new_shards(tmp_path: Path) -> None:
 
 
 def test_shard_boundaries_and_oversized_record(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
     dataset.extend(
         [(b"a", b"12"), (b"b", b"34"), (b"large", b"x" * 20)],
         max_shard_size=6,
@@ -124,11 +128,36 @@ def test_malformed_index(tmp_path: Path) -> None:
 
 
 def test_index_contains_uint32_sizes(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
     dataset.extend([(b"abc", b"value")])
 
     sizes = np.fromfile(dataset.path / "index.bin", dtype="<u4").reshape(-1, 2)
     np.testing.assert_array_equal(sizes, [[3, 5]])
+
+
+def test_uncompressed_values_are_zero_copy(tmp_path: Path) -> None:
+    dataset = BitcaskDataset(tmp_path / "data", compression=None)
+    dataset.extend([b"value"])
+
+    value = dataset.at(0)
+    assert isinstance(value, memoryview)
+    assert bytes(value) == b"value"
+
+
+def test_lz4_high_compression(tmp_path: Path) -> None:
+    dataset = BitcaskDataset(tmp_path / "data")
+    value = b"repetitive" * 10_000
+    dataset.extend([value])
+
+    stored_size = int(np.fromfile(dataset.path / "index.bin", dtype="<u4")[0])
+    assert stored_size < len(value)
+    assert dataset.at(0) == value
+    assert isinstance(dataset.at(0), bytes)
+
+
+def test_invalid_compression(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported compression"):
+        BitcaskDataset(tmp_path / "data", compression="gzip")  # type: ignore[arg-type]
 
 
 def test_missing_key_and_bad_position(tmp_path: Path) -> None:

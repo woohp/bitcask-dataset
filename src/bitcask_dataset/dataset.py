@@ -4,10 +4,11 @@ import struct
 import tempfile
 from collections.abc import Buffer, Iterable
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 import numpy as np
 import numpy.typing as npt
+from lz4 import block
 
 DEFAULT_MAX_SHARD_SIZE = 1 << 30
 MAX_FIELD_SIZE = np.iinfo(np.uint32).max
@@ -15,6 +16,7 @@ INDEX_DTYPE = np.dtype("<u4")
 EMPTY_VIEW = memoryview(b"")
 
 type Entry = tuple[Buffer, Buffer]
+type Compression = Literal["lz4"] | None
 type UIntArray = npt.NDArray[np.unsignedinteger]
 type Shard = mmap.mmap | memoryview
 
@@ -22,9 +24,16 @@ type Shard = mmap.mmap | memoryview
 class BitcaskDataset:
     """An append-oriented, mmap-backed collection of byte blobs."""
 
-    def __init__(self, path: str | Path, *, keyed: bool = False) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        keyed: bool = False,
+        compression: Compression = "lz4",
+    ) -> None:
         self.path = Path(path)
         self.keyed = keyed
+        self.compression = _validate_compression(compression)
 
         if not self.path.exists():
             _initialize_empty_dataset(self.path)
@@ -51,6 +60,7 @@ class BitcaskDataset:
             self.path,
             entries,
             keyed=self.keyed,
+            compression=self.compression,
             existing_keys=self._keys,
             first_shard_id=len(self._shards),
             max_shard_size=max_shard_size,
@@ -69,7 +79,7 @@ class BitcaskDataset:
             return False
         return normalized in self._keys
 
-    def __getitem__(self, key: Buffer) -> memoryview:
+    def __getitem__(self, key: Buffer) -> bytes | memoryview:
         if not self.keyed:
             raise TypeError("key lookup is disabled for this dataset")
         normalized = _as_key(key)
@@ -79,7 +89,7 @@ class BitcaskDataset:
             raise KeyError(normalized) from None
         return self._value_at(index)
 
-    def at(self, index: int) -> memoryview:
+    def at(self, index: int) -> bytes | memoryview:
         """Return a value by insertion position."""
         return self._value_at(self._normalize_index(index))
 
@@ -89,11 +99,11 @@ class BitcaskDataset:
             raise TypeError("keys are disabled for this dataset")
         return self._key_at(self._normalize_index(index))
 
-    def __getstate__(self) -> tuple[Path, bool]:
-        return self.path, self.keyed
+    def __getstate__(self) -> tuple[Path, bool, Compression]:
+        return self.path, self.keyed, self.compression
 
-    def __setstate__(self, state: tuple[Path, bool]) -> None:
-        self.path, self.keyed = state
+    def __setstate__(self, state: tuple[Path, bool, Compression]) -> None:
+        self.path, self.keyed, self.compression = state
         self._load()
 
     def _load(self) -> None:
@@ -135,16 +145,19 @@ class BitcaskDataset:
         offset = int(self._record_offsets[index])
         return memoryview(self._shards[shard_id])[offset : offset + key_size]
 
-    def _value_at(self, index: int) -> memoryview:
+    def _value_at(self, index: int) -> bytes | memoryview:
         key_size = int(self._sizes[index, 0]) if self.keyed else 0
         value_column = 1 if self.keyed else 0
         value_size = int(self._sizes[index, value_column])
         if value_size == 0:
-            return EMPTY_VIEW
+            return b"" if self.compression else EMPTY_VIEW
 
         shard_id = int(self._shard_ids[index])
         offset = int(self._record_offsets[index]) + key_size
-        return memoryview(self._shards[shard_id])[offset : offset + value_size]
+        value = memoryview(self._shards[shard_id])[offset : offset + value_size]
+        if self.compression == "lz4":
+            return block.decompress(value)  # type: ignore[attr-defined, no-any-return]
+        return value
 
     def _normalize_index(self, index: int) -> int:
         if not isinstance(index, int):
@@ -154,6 +167,14 @@ class BitcaskDataset:
         if index < 0 or index >= len(self):
             raise IndexError(index)
         return index
+
+
+def _validate_compression(compression: str | None) -> Compression:
+    if compression == "lz4":
+        return "lz4"
+    if compression is None:
+        return None
+    raise ValueError(f"unsupported compression: {compression!r}")
 
 
 def _initialize_empty_dataset(path: Path) -> None:
@@ -180,6 +201,7 @@ def _extend_dataset(
     entries: Iterable[Buffer | Entry],
     *,
     keyed: bool,
+    compression: Compression,
     existing_keys: dict[bytes, int],
     first_shard_id: int,
     max_shard_size: int,
@@ -217,7 +239,18 @@ def _extend_dataset(
                 if value.nbytes > MAX_FIELD_SIZE:
                     raise ValueError("value must fit in uint32")
 
-                record_size = key.nbytes + value.nbytes
+                stored_value: bytes | memoryview
+                if compression == "lz4" and value.nbytes:
+                    stored_value = block.compress(  # type: ignore[attr-defined]
+                        value, mode="high_compression", store_size=True
+                    )
+                else:
+                    stored_value = value
+                stored_value_size = len(stored_value)
+                if stored_value_size > MAX_FIELD_SIZE:
+                    raise ValueError("encoded value must fit in uint32")
+
+                record_size = key.nbytes + stored_value_size
                 if shard_file is None or (shard_size and shard_size + record_size > max_shard_size):
                     if shard_file is not None:
                         _finish_file(shard_file)
@@ -229,12 +262,12 @@ def _extend_dataset(
                     shard_size = 0
 
                 shard_file.write(key)
-                shard_file.write(value)
+                shard_file.write(stored_value)
                 shard_size += record_size
                 if keyed:
-                    index_file.write(struct.pack("<II", key.nbytes, value.nbytes))
+                    index_file.write(struct.pack("<II", key.nbytes, stored_value_size))
                 else:
-                    index_file.write(struct.pack("<I", value.nbytes))
+                    index_file.write(struct.pack("<I", stored_value_size))
 
             if shard_file is not None:
                 _finish_file(shard_file)
