@@ -20,10 +20,11 @@ type Shard = mmap.mmap | memoryview
 
 
 class BitcaskDataset:
-    """An append-oriented, mmap-backed collection of keyed byte blobs."""
+    """An append-oriented, mmap-backed collection of byte blobs."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, keyed: bool = False) -> None:
         self.path = Path(path)
+        self.keyed = keyed
 
         if not self.path.exists():
             _initialize_empty_dataset(self.path)
@@ -32,23 +33,24 @@ class BitcaskDataset:
         elif not any(self.path.iterdir()):
             _initialize_empty_dataset(self.path)
         else:
-            _validate_layout(self.path)
+            _validate_layout(self.path, keyed=keyed)
 
         self._load()
 
     def extend(
         self,
-        entries: Iterable[Entry],
+        entries: Iterable[Buffer | Entry],
         *,
         max_shard_size: int = DEFAULT_MAX_SHARD_SIZE,
     ) -> None:
-        """Add unique key/value pairs using new, immutable shards."""
+        """Add values, or unique key/value pairs for a keyed dataset."""
         if max_shard_size <= 0:
             raise ValueError("max_shard_size must be positive")
 
         _extend_dataset(
             self.path,
             entries,
+            keyed=self.keyed,
             existing_keys=self._keys,
             first_shard_id=len(self._shards),
             max_shard_size=max_shard_size,
@@ -59,6 +61,8 @@ class BitcaskDataset:
         return self._sizes.shape[0]
 
     def __contains__(self, key: object) -> bool:
+        if not self.keyed:
+            return False
         try:
             normalized = _as_key(key)
         except (TypeError, ValueError):
@@ -66,6 +70,8 @@ class BitcaskDataset:
         return normalized in self._keys
 
     def __getitem__(self, key: Buffer) -> memoryview:
+        if not self.keyed:
+            raise TypeError("key lookup is disabled for this dataset")
         normalized = _as_key(key)
         try:
             index = self._keys[normalized]
@@ -79,22 +85,25 @@ class BitcaskDataset:
 
     def key_at(self, index: int) -> memoryview:
         """Return a key by insertion position."""
+        if not self.keyed:
+            raise TypeError("keys are disabled for this dataset")
         return self._key_at(self._normalize_index(index))
 
-    def __getstate__(self) -> Path:
-        return self.path
+    def __getstate__(self) -> tuple[Path, bool]:
+        return self.path, self.keyed
 
-    def __setstate__(self, path: Path) -> None:
-        self.path = path
+    def __setstate__(self, state: tuple[Path, bool]) -> None:
+        self.path, self.keyed = state
         self._load()
 
     def _load(self) -> None:
         index_path = self.path / "index.bin"
+        columns = 2 if self.keyed else 1
         if index_path.stat().st_size:
             raw_sizes = np.memmap(index_path, dtype=INDEX_DTYPE, mode="r")
-            self._sizes = raw_sizes.reshape(-1, 2)
+            self._sizes = raw_sizes.reshape(-1, columns)
         else:
-            self._sizes = np.empty((0, 2), dtype=INDEX_DTYPE)
+            self._sizes = np.empty((0, columns), dtype=INDEX_DTYPE)
 
         shard_paths = _shard_paths(self.path / "shards")
         shard_sizes = np.asarray([path.stat().st_size for path in shard_paths], dtype=np.uint64)
@@ -110,11 +119,12 @@ class BitcaskDataset:
         self._shard_ids = shard_ids
         self._record_offsets = record_offsets
         self._keys: dict[bytes, int] = {}
-        for index in range(len(self)):
-            key = bytes(self._key_at(index))
-            if key in self._keys:
-                raise ValueError(f"duplicate key in dataset: {key!r}")
-            self._keys[key] = index
+        if self.keyed:
+            for index in range(len(self)):
+                key = bytes(self._key_at(index))
+                if key in self._keys:
+                    raise ValueError(f"duplicate key in dataset: {key!r}")
+                self._keys[key] = index
 
     def _key_at(self, index: int) -> memoryview:
         key_size = int(self._sizes[index, 0])
@@ -126,8 +136,9 @@ class BitcaskDataset:
         return memoryview(self._shards[shard_id])[offset : offset + key_size]
 
     def _value_at(self, index: int) -> memoryview:
-        key_size = int(self._sizes[index, 0])
-        value_size = int(self._sizes[index, 1])
+        key_size = int(self._sizes[index, 0]) if self.keyed else 0
+        value_column = 1 if self.keyed else 0
+        value_size = int(self._sizes[index, value_column])
         if value_size == 0:
             return EMPTY_VIEW
 
@@ -151,21 +162,24 @@ def _initialize_empty_dataset(path: Path) -> None:
     (path / "index.bin").touch()
 
 
-def _validate_layout(path: Path) -> None:
+def _validate_layout(path: Path, *, keyed: bool) -> None:
     index_path = path / "index.bin"
     shards_path = path / "shards"
     if not index_path.is_file():
         raise ValueError(f"missing dataset index: {index_path}")
     if not shards_path.is_dir():
         raise ValueError(f"missing shards directory: {shards_path}")
-    if index_path.stat().st_size % 8:
-        raise ValueError("index size is not a multiple of 8 bytes")
+
+    entry_size = 8 if keyed else 4
+    if index_path.stat().st_size % entry_size:
+        raise ValueError(f"index size is not a multiple of {entry_size} bytes")
 
 
 def _extend_dataset(
     path: Path,
-    entries: Iterable[Entry],
+    entries: Iterable[Buffer | Entry],
     *,
+    keyed: bool,
     existing_keys: dict[bytes, int],
     first_shard_id: int,
     max_shard_size: int,
@@ -185,17 +199,23 @@ def _extend_dataset(
             with (path / "index.bin").open("rb") as old_index:
                 _copy_file(old_index, index_file)
 
-            for key_buffer, value_buffer in entries:
-                key = _as_bytes_view(key_buffer)
-                value = _as_bytes_view(value_buffer)
-                key_copy = bytes(key)
+            for entry in entries:
+                if keyed:
+                    key, value = _entry_views(entry)
+                    key_copy = bytes(key)
+                    if key_copy in existing_keys or key_copy in new_keys:
+                        raise ValueError(f"duplicate key: {key_copy!r}")
+                    new_keys.add(key_copy)
+                    if key.nbytes > MAX_FIELD_SIZE:
+                        raise ValueError("key must fit in uint32")
+                else:
+                    if not isinstance(entry, Buffer):
+                        raise TypeError("keyless datasets require an iterable of buffers")
+                    key = EMPTY_VIEW
+                    value = _as_bytes_view(entry)
 
-                if key_copy in existing_keys or key_copy in new_keys:
-                    raise ValueError(f"duplicate key: {key_copy!r}")
-                new_keys.add(key_copy)
-
-                if key.nbytes > MAX_FIELD_SIZE or value.nbytes > MAX_FIELD_SIZE:
-                    raise ValueError("key and value must each fit in uint32")
+                if value.nbytes > MAX_FIELD_SIZE:
+                    raise ValueError("value must fit in uint32")
 
                 record_size = key.nbytes + value.nbytes
                 if shard_file is None or (shard_size and shard_size + record_size > max_shard_size):
@@ -211,7 +231,10 @@ def _extend_dataset(
                 shard_file.write(key)
                 shard_file.write(value)
                 shard_size += record_size
-                index_file.write(struct.pack("<II", key.nbytes, value.nbytes))
+                if keyed:
+                    index_file.write(struct.pack("<II", key.nbytes, value.nbytes))
+                else:
+                    index_file.write(struct.pack("<I", value.nbytes))
 
             if shard_file is not None:
                 _finish_file(shard_file)
@@ -236,7 +259,7 @@ def _build_locations(
     sizes: npt.NDArray[np.uint32],
     shard_sizes: npt.NDArray[np.uint64],
 ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint64]]:
-    record_sizes = sizes[:, 0].astype(np.uint64) + sizes[:, 1]
+    record_sizes = sizes.sum(axis=1, dtype=np.uint64)
     record_ends = np.cumsum(record_sizes, dtype=np.uint64)
     global_starts = np.empty_like(record_ends)
     if global_starts.size:
@@ -289,6 +312,13 @@ def _mmap_readonly(path: Path) -> Shard:
         return EMPTY_VIEW
     with path.open("rb") as file:
         return mmap.mmap(file.fileno(), length=0, access=mmap.ACCESS_READ)
+
+
+def _entry_views(entry: Buffer | Entry) -> tuple[memoryview, memoryview]:
+    if isinstance(entry, Buffer):
+        raise TypeError("keyed datasets require an iterable of (key, value) pairs")
+    key, value = entry
+    return _as_bytes_view(key), _as_bytes_view(value)
 
 
 def _as_key(value: object) -> bytes:

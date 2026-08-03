@@ -1,7 +1,7 @@
 # bitcask-dataset
 
-Basically a disk-backed `dict[bytes, bytes]` for datasets. Data is append-only,
-split into shards, and mmap'd when opened. Reads don't copy.
+Basically a disk-backed collection of byte blobs, optionally keyed by bytes. Data is
+append-only, split into shards, and mmap'd when opened. Reads don't copy.
 
 This is mostly for training data where serialization is somebody else's problem.
 
@@ -16,7 +16,7 @@ uv add bitcask-dataset
 ```python
 from bitcask_dataset import BitcaskDataset
 
-ds = BitcaskDataset("my-dataset")  # creates the directory if needed
+ds = BitcaskDataset("my-dataset", keyed=True)  # creates the directory if needed
 ds.extend([
     (b"image/1", image_bytes),
     (b"image/2", more_image_bytes),
@@ -33,12 +33,20 @@ len(ds)
 b"image/1" in ds
 ```
 
+Keys are optional:
+
+```python
+ds = BitcaskDataset("my-keyless-dataset")
+ds.extend([image_bytes, more_image_bytes])
+value = ds.at(0)
+```
+
 Keys and values can be anything with the buffer protocol.
 
 ## API
 
 ```python
-BitcaskDataset(path)
+BitcaskDataset(path, keyed=False)
 ds.extend(entries, max_shard_size=1 << 30)
 ds[key]
 ds.at(index)
@@ -50,12 +58,16 @@ key in ds
 A missing or empty path is initialized. An existing non-dataset directory is an
 error.
 
-`extend` takes an iterable of `(key, value)` pairs. Duplicate keys are errors. It
-only creates new shards; it never adds data to an old one. Records aren't split, so
-a record over `max_shard_size` gets a shard to itself.
+In keyed mode, `extend` takes `(key, value)` pairs and duplicate keys are errors. In
+keyless mode it takes values directly. It only creates new shards; it never adds data
+to an old one. Records aren't split, so a record over `max_shard_size` gets a shard
+to itself.
 
-`ds[key]`, `at`, and `key_at` return read-only `memoryview`s. `at` and `key_at` also
-support negative indexes.
+`ds[key]`, `at`, and `key_at` return read-only `memoryview`s. `at` and `key_at` support
+negative indexes. Key lookup and `key_at` raise `TypeError` in keyless mode.
+
+There is no metadata file yet, so remember to pass `keyed=True` every time you open
+a keyed dataset. Opening either format in the wrong mode may misread the index.
 
 ## Format
 
@@ -67,17 +79,19 @@ my-dataset/
         000001.bin
 ```
 
-The index is little-endian `uint32` pairs:
+The keyed index is little-endian `uint32` pairs:
 
 ```text
 key_size, value_size, key_size, value_size, ...
 ```
 
-Shards are just `key || value || key || value ...`. No headers or padding. NumPy
-does a cumsum at startup and works out the shard/offset for each record.
+The keyless index is one `uint32` value size per item. Keyed shards are
+`key || value || key || value ...`; keyless shards only contain values. There are no
+headers or padding. NumPy does a cumsum at startup and works out the shard/offset for
+each record.
 
-Keys are copied into a Python dict at startup. Values stay in the mmap. Each key and
-value is limited to `2**32 - 1` bytes.
+Keyed datasets copy keys into a Python dict at startup. Values stay in the mmap. Each
+key and value is limited to `2**32 - 1` bytes.
 
 ## Missing stuff
 
