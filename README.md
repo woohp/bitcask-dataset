@@ -8,7 +8,7 @@ This is mostly for training data where serialization is somebody else's problem.
 ## Install
 
 ```bash
-uv add bitcask-dataset
+pip install bitcask-dataset
 ```
 
 ## Example
