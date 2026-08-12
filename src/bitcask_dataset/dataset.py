@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import mmap
 import os
 import struct
 import tempfile
 from collections.abc import Buffer, Iterable
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, cast, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -21,8 +23,35 @@ type UIntArray = npt.NDArray[np.unsignedinteger]
 type Shard = mmap.mmap | memoryview
 
 
-class BitcaskDataset:
+class BitcaskDataset[ValueT: Buffer]:
     """An append-oriented, mmap-backed collection of byte blobs."""
+
+    @overload
+    def __init__(
+        self: BitcaskDataset[bytes],
+        path: str | Path,
+        *,
+        keyed: bool = False,
+        compression: Literal["lz4"] = "lz4",
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: BitcaskDataset[memoryview],
+        path: str | Path,
+        *,
+        keyed: bool = False,
+        compression: None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self: BitcaskDataset[bytes | memoryview],
+        path: str | Path,
+        *,
+        keyed: bool = False,
+        compression: Compression,
+    ) -> None: ...
 
     def __init__(
         self,
@@ -33,7 +62,7 @@ class BitcaskDataset:
     ) -> None:
         self.path = Path(path)
         self.keyed = keyed
-        self.compression = _validate_compression(compression)
+        self._compression = _validate_compression(compression)
 
         if not self.path.exists():
             _initialize_empty_dataset(self.path)
@@ -79,7 +108,11 @@ class BitcaskDataset:
             return False
         return normalized in self._keys
 
-    def __getitem__(self, key: Buffer) -> bytes | memoryview:
+    @property
+    def compression(self) -> Compression:
+        return self._compression
+
+    def __getitem__(self, key: Buffer) -> ValueT:
         if not self.keyed:
             raise TypeError("key lookup is disabled for this dataset")
         normalized = _as_key(key)
@@ -89,7 +122,7 @@ class BitcaskDataset:
             raise KeyError(normalized) from None
         return self._value_at(index)
 
-    def at(self, index: int) -> bytes | memoryview:
+    def at(self, index: int) -> ValueT:
         """Return a value by insertion position."""
         return self._value_at(self._normalize_index(index))
 
@@ -103,7 +136,7 @@ class BitcaskDataset:
         return self.path, self.keyed, self.compression
 
     def __setstate__(self, state: tuple[Path, bool, Compression]) -> None:
-        self.path, self.keyed, self.compression = state
+        self.path, self.keyed, self._compression = state
         self._load()
 
     def _load(self) -> None:
@@ -145,19 +178,21 @@ class BitcaskDataset:
         offset = int(self._record_offsets[index])
         return memoryview(self._shards[shard_id])[offset : offset + key_size]
 
-    def _value_at(self, index: int) -> bytes | memoryview:
+    def _value_at(self, index: int) -> ValueT:
         key_size = int(self._sizes[index, 0]) if self.keyed else 0
         value_column = 1 if self.keyed else 0
         value_size = int(self._sizes[index, value_column])
         if value_size == 0:
-            return b"" if self.compression else EMPTY_VIEW
+            empty = b"" if self.compression else EMPTY_VIEW
+            return cast(ValueT, empty)
 
         shard_id = int(self._shard_ids[index])
         offset = int(self._record_offsets[index]) + key_size
         value = memoryview(self._shards[shard_id])[offset : offset + value_size]
         if self.compression == "lz4":
-            return block.decompress(value)  # type: ignore[attr-defined, no-any-return]
-        return value
+            decompressed = block.decompress(value)  # type: ignore[attr-defined]
+            return cast(ValueT, decompressed)
+        return cast(ValueT, value)
 
     def _normalize_index(self, index: int) -> int:
         if not isinstance(index, int):

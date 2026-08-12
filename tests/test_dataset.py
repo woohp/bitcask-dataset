@@ -157,7 +157,7 @@ def test_lz4_high_compression(tmp_path: Path) -> None:
 
 def test_invalid_compression(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unsupported compression"):
-        BitcaskDataset(tmp_path / "data", compression="gzip")  # type: ignore[arg-type]
+        BitcaskDataset(tmp_path / "data", compression="gzip")  # type: ignore[call-overload]
 
 
 def test_missing_key_and_bad_position(tmp_path: Path) -> None:
