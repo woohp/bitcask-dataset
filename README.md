@@ -58,9 +58,9 @@ array, ...).
 ## API
 
 ```python
-BitcaskDataset.create(path, keyed=False, compression="lz4")
+BitcaskDataset.create(path, keyed=False, compression="lz4", max_shard_size=1 << 30)
 BitcaskDataset(path)
-ds.extend(entries, max_shard_size=1 << 30)
+ds.extend(entries)
 ds[key]
 ds.at(index)
 ds.key_at(index)
@@ -69,7 +69,8 @@ key in ds
 ```
 
 `create` needs a missing or empty directory. `BitcaskDataset(path)` opens an existing
-dataset; `keyed` and `compression` are fixed at creation and read from the manifest.
+dataset; `keyed`, `compression`, and `max_shard_size` are fixed at creation and read
+from the manifest.
 
 In keyed mode, `extend` takes `(key, value)` pairs and duplicate keys are errors. In
 keyless mode it takes values directly. Each `extend` is all-or-nothing and only
@@ -97,7 +98,7 @@ my-dataset/
 `manifest.json` holds the settings and how many shards are committed:
 
 ```json
-{"keyed": true, "compression": "lz4", "shards": 2}
+{"keyed": true, "compression": "lz4", "max_shard_size": 1073741824, "shards": 2}
 ```
 
 Each `.idx` lists its shard's records as little-endian `uint32` sizes: `key_size,

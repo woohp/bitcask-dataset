@@ -1,3 +1,4 @@
+import json
 import mmap
 import pickle
 from pathlib import Path
@@ -28,12 +29,15 @@ def test_create_extend_and_lookup(tmp_path: Path) -> None:
 
 def test_reopen_and_unpickle_read_settings_from_manifest(tmp_path: Path) -> None:
     path = tmp_path / "data"
-    dataset = BitcaskDataset.create(path, keyed=True, compression=None)
+    dataset = BitcaskDataset.create(
+        path, keyed=True, compression=None, max_shard_size=1000
+    )
     dataset.extend([(b"key", b"value")])
 
     for reopened in (BitcaskDataset(path), pickle.loads(pickle.dumps(dataset))):
         assert reopened.keyed is True
         assert reopened.compression is None
+        assert reopened.max_shard_size == 1000
         assert bytes(reopened[b"key"]) == b"value"
         assert bytes(reopened.key_at(0)) == b"key"
 
@@ -57,12 +61,11 @@ def test_keyless_dataset(tmp_path: Path) -> None:
 
 
 def test_shard_boundaries_and_new_shards_per_extend(tmp_path: Path) -> None:
-    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True, compression=None)
-    dataset.extend(
-        [(b"a", b"12"), (b"b", b"34"), (b"large", b"x" * 20)],
-        max_shard_size=6,
+    dataset = BitcaskDataset.create(
+        tmp_path / "data", keyed=True, compression=None, max_shard_size=6
     )
-    dataset.extend([(b"c", b"5")], max_shard_size=6)
+    dataset.extend([(b"a", b"12"), (b"b", b"34"), (b"large", b"x" * 20)])
+    dataset.extend([(b"c", b"5")])
 
     assert sorted(path.name for path in dataset.path.glob("*.bin")) == [
         "000000.bin",
@@ -121,9 +124,8 @@ def test_failed_refresh_commits_nothing(tmp_path: Path) -> None:
         (path / f"000001.{suffix}").write_bytes(
             (path / f"000000.{suffix}").read_bytes()
         )
-    (path / "manifest.json").write_text(
-        '{"keyed": true, "compression": null, "shards": 2}'
-    )
+    manifest = json.loads((path / "manifest.json").read_text())
+    (path / "manifest.json").write_text(json.dumps({**manifest, "shards": 2}))
 
     for _ in range(2):
         with pytest.raises(ValueError, match="duplicate keys"):
