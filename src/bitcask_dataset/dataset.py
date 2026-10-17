@@ -125,7 +125,7 @@ class BitcaskDataset:
             self._shards.append(shard)
             sizes.append(shard_sizes)
             shard_ids.append(np.full(len(shard_sizes), shard_id, dtype=np.uint32))
-            record_offsets.append(np.cumsum(record_sizes) - record_sizes)
+            record_offsets.append(np.cumsum(record_sizes, dtype=np.uint64) - record_sizes)
 
         self._sizes = np.concatenate(sizes)
         self._shard_ids = np.concatenate(shard_ids)
