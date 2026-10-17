@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mmap
 import os
+import shutil
 import struct
 import tempfile
 from collections.abc import Buffer, Iterable
@@ -212,7 +213,7 @@ def _extend_dataset(
     try:
         with os.fdopen(index_fd, "wb") as index_file:
             with (path / "index.bin").open("rb") as old_index:
-                _copy_file(old_index, index_file)
+                shutil.copyfileobj(old_index, index_file)
 
             for entry in entries:
                 if keyed:
@@ -338,11 +339,6 @@ def _as_bytes_view(value: Buffer) -> memoryview:
     except TypeError:
         raise TypeError("keys and values must support the buffer protocol") from None
     return view.cast("B")
-
-
-def _copy_file(source: BinaryIO, destination: BinaryIO) -> None:
-    while chunk := source.read(1024 * 1024):
-        destination.write(chunk)
 
 
 def _finish_file(file: BinaryIO) -> None:
