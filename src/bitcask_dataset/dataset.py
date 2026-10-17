@@ -6,7 +6,7 @@ import struct
 import tempfile
 from collections.abc import Buffer, Iterable
 from pathlib import Path
-from typing import BinaryIO, Literal, cast, overload
+from typing import BinaryIO, Literal, SupportsIndex, cast, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -63,16 +63,8 @@ class BitcaskDataset[ValueT: Buffer]:
         self.path = Path(path)
         self.keyed = keyed
         self._compression = _validate_compression(compression)
-
-        if not self.path.exists():
+        if not self.path.exists() or not any(self.path.iterdir()):
             _initialize_empty_dataset(self.path)
-        elif not self.path.is_dir():
-            raise ValueError(f"dataset path is not a directory: {self.path}")
-        elif not any(self.path.iterdir()):
-            _initialize_empty_dataset(self.path)
-        else:
-            _validate_layout(self.path, keyed=keyed)
-
         self._load()
 
     def extend(
@@ -100,13 +92,7 @@ class BitcaskDataset[ValueT: Buffer]:
         return self._sizes.shape[0]
 
     def __contains__(self, key: object) -> bool:
-        if not self.keyed:
-            return False
-        try:
-            normalized = _as_key(key)
-        except (TypeError, ValueError):
-            return False
-        return normalized in self._keys
+        return self.keyed and isinstance(key, Buffer) and _as_key(key) in self._keys
 
     @property
     def compression(self) -> Compression:
@@ -122,15 +108,15 @@ class BitcaskDataset[ValueT: Buffer]:
             raise KeyError(normalized) from None
         return self._value_at(index)
 
-    def at(self, index: int) -> ValueT:
+    def at(self, index: SupportsIndex) -> ValueT:
         """Return a value by insertion position."""
-        return self._value_at(self._normalize_index(index))
+        return self._value_at(index)
 
-    def key_at(self, index: int) -> memoryview:
+    def key_at(self, index: SupportsIndex) -> memoryview:
         """Return a key by insertion position."""
         if not self.keyed:
             raise TypeError("keys are disabled for this dataset")
-        return self._key_at(self._normalize_index(index))
+        return self._key_at(index)
 
     def __getstate__(self) -> tuple[Path, bool, Compression]:
         return self.path, self.keyed, self.compression
@@ -150,26 +136,20 @@ class BitcaskDataset[ValueT: Buffer]:
 
         shard_paths = _shard_paths(self.path / "shards")
         shard_sizes = np.asarray([path.stat().st_size for path in shard_paths], dtype=np.uint64)
-        expected_size = int(self._sizes.astype(np.uint64).sum())
+        expected_size = int(self._sizes.sum(dtype=np.uint64))
         actual_size = int(shard_sizes.sum())
         if actual_size != expected_size:
             raise ValueError(f"shard data size is {actual_size}, expected {expected_size}")
 
-        shards = [_mmap_readonly(path) for path in shard_paths]
-        shard_ids, record_offsets = _build_locations(self._sizes, shard_sizes)
-
-        self._shards = shards
-        self._shard_ids = shard_ids
-        self._record_offsets = record_offsets
+        self._shards = [_mmap_readonly(path) for path in shard_paths]
+        self._shard_ids, self._record_offsets = _build_locations(self._sizes, shard_sizes)
         self._keys: dict[bytes, int] = {}
         if self.keyed:
-            for index in range(len(self)):
-                key = bytes(self._key_at(index))
-                if key in self._keys:
-                    raise ValueError(f"duplicate key in dataset: {key!r}")
-                self._keys[key] = index
+            self._keys = {bytes(self._key_at(index)): index for index in range(len(self))}
+            if len(self._keys) != len(self):
+                raise ValueError("duplicate keys in dataset")
 
-    def _key_at(self, index: int) -> memoryview:
+    def _key_at(self, index: SupportsIndex) -> memoryview:
         key_size = int(self._sizes[index, 0])
         if key_size == 0:
             return EMPTY_VIEW
@@ -178,7 +158,7 @@ class BitcaskDataset[ValueT: Buffer]:
         offset = int(self._record_offsets[index])
         return memoryview(self._shards[shard_id])[offset : offset + key_size]
 
-    def _value_at(self, index: int) -> ValueT:
+    def _value_at(self, index: SupportsIndex) -> ValueT:
         key_size = int(self._sizes[index, 0]) if self.keyed else 0
         value_column = 1 if self.keyed else 0
         value_size = int(self._sizes[index, value_column])
@@ -194,15 +174,6 @@ class BitcaskDataset[ValueT: Buffer]:
             return cast(ValueT, decompressed)
         return cast(ValueT, value)
 
-    def _normalize_index(self, index: int) -> int:
-        if not isinstance(index, int):
-            raise TypeError("position must be an integer")
-        if index < 0:
-            index += len(self)
-        if index < 0 or index >= len(self):
-            raise IndexError(index)
-        return index
-
 
 def _validate_compression(compression: str | None) -> Compression:
     if compression == "lz4":
@@ -216,19 +187,6 @@ def _initialize_empty_dataset(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     (path / "shards").mkdir()
     (path / "index.bin").touch()
-
-
-def _validate_layout(path: Path, *, keyed: bool) -> None:
-    index_path = path / "index.bin"
-    shards_path = path / "shards"
-    if not index_path.is_file():
-        raise ValueError(f"missing dataset index: {index_path}")
-    if not shards_path.is_dir():
-        raise ValueError(f"missing shards directory: {shards_path}")
-
-    entry_size = 8 if keyed else 4
-    if index_path.stat().st_size % entry_size:
-        raise ValueError(f"index size is not a multiple of {entry_size} bytes")
 
 
 def _extend_dataset(
@@ -270,9 +228,6 @@ def _extend_dataset(
                         raise TypeError("keyless datasets require an iterable of buffers")
                     key = EMPTY_VIEW
                     value = _as_bytes_view(entry)
-
-                if value.nbytes > MAX_FIELD_SIZE:
-                    raise ValueError("value must fit in uint32")
 
                 stored_value: bytes | memoryview
                 if compression == "lz4" and value.nbytes:
@@ -328,34 +283,18 @@ def _build_locations(
     shard_sizes: npt.NDArray[np.uint64],
 ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint64]]:
     record_sizes = sizes.sum(axis=1, dtype=np.uint64)
-    record_ends = np.cumsum(record_sizes, dtype=np.uint64)
-    global_starts = np.empty_like(record_ends)
-    if global_starts.size:
-        global_starts[0] = 0
-        global_starts[1:] = record_ends[:-1]
+    global_starts = np.cumsum(record_sizes) - record_sizes
+    shard_ends = np.cumsum(shard_sizes)
 
     shard_ids = np.zeros(record_sizes.size, dtype=np.uint32)
     record_offsets = np.zeros(record_sizes.size, dtype=np.uint64)
     nonempty = record_sizes != 0
-    if not np.any(nonempty):
-        return shard_ids, record_offsets
-
-    shard_ends = np.cumsum(shard_sizes, dtype=np.uint64)
-    if not shard_ends.size:
-        raise ValueError("index references data but there are no shards")
-
     resolved_ids = np.searchsorted(shard_ends, global_starts[nonempty], side="right")
-    if np.any(resolved_ids >= shard_ends.size):
-        raise ValueError("index references data beyond the shards")
-    if shard_ends.size > MAX_FIELD_SIZE:
-        raise ValueError("dataset has too many shards")
-
-    shard_starts = shard_ends - shard_sizes
-    resolved_offsets = global_starts[nonempty] - shard_starts[resolved_ids]
+    resolved_offsets = global_starts[nonempty] - (shard_ends - shard_sizes)[resolved_ids]
     if np.any(resolved_offsets + record_sizes[nonempty] > shard_sizes[resolved_ids]):
         raise ValueError("an indexed record crosses a shard boundary")
 
-    shard_ids[nonempty] = resolved_ids.astype(np.uint32)
+    shard_ids[nonempty] = resolved_ids
     record_offsets[nonempty] = resolved_offsets
     return shard_ids, record_offsets
 
@@ -389,9 +328,7 @@ def _entry_views(entry: Buffer | Entry) -> tuple[memoryview, memoryview]:
     return _as_bytes_view(key), _as_bytes_view(value)
 
 
-def _as_key(value: object) -> bytes:
-    if not isinstance(value, Buffer):
-        raise TypeError("keys must support the buffer protocol")
+def _as_key(value: Buffer) -> bytes:
     return bytes(_as_bytes_view(value))
 
 
@@ -400,8 +337,6 @@ def _as_bytes_view(value: Buffer) -> memoryview:
         view = memoryview(value)
     except TypeError:
         raise TypeError("keys and values must support the buffer protocol") from None
-    if not view.contiguous:
-        raise ValueError("keys and values must be contiguous")
     return view.cast("B")
 
 

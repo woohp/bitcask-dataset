@@ -15,6 +15,7 @@ def test_create_extend_and_lookup(tmp_path: Path) -> None:
     assert bytes(dataset[b"a"]) == b"alpha"
     assert bytes(dataset.at(1)) == b"beta"
     assert bytes(dataset.at(-1)) == b"beta"
+    assert bytes(dataset.at(np.int64(1))) == b"beta"
     assert b"a" in dataset
     assert b"missing" not in dataset
 
@@ -114,7 +115,7 @@ def test_invalid_existing_directory(tmp_path: Path) -> None:
     path.mkdir()
     (path / "other").write_text("not a dataset")
 
-    with pytest.raises(ValueError, match="missing dataset index"):
+    with pytest.raises(FileNotFoundError):
         BitcaskDataset(path, keyed=True)
 
 
@@ -123,7 +124,7 @@ def test_malformed_index(tmp_path: Path) -> None:
     (path / "shards").mkdir(parents=True)
     (path / "index.bin").write_bytes(b"bad")
 
-    with pytest.raises(ValueError, match="multiple of 8"):
+    with pytest.raises(ValueError, match="multiple of the data-type size"):
         BitcaskDataset(path, keyed=True)
 
 
