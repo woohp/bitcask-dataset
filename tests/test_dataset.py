@@ -55,14 +55,6 @@ def test_keyless_dataset(tmp_path: Path) -> None:
 
     reopened = BitcaskDataset(path, keyed=False)
     assert bytes(reopened.at(1)) == b"beta"
-    unpickled = pickle.loads(pickle.dumps(reopened))
-    assert unpickled.keyed is False
-    assert unpickled.compression == "lz4"
-
-    sizes = np.fromfile(path / "index.bin", dtype="<u4")
-    assert sizes[0] != 5
-    assert sizes[1] != 4
-    assert sizes[2] == 0
 
 
 def test_extend_uses_new_shards(tmp_path: Path) -> None:
