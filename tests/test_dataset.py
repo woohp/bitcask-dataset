@@ -10,38 +10,32 @@ from bitcask_dataset import BitcaskDataset
 
 def test_create_extend_and_lookup(tmp_path: Path) -> None:
     dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
-    dataset.extend([(b"a", b"alpha"), (b"b", b"beta")])
+    dataset.extend([(b"a", b"alpha"), (b"b", b"beta"), (b"", b"")])
 
-    assert len(dataset) == 2
+    assert len(dataset) == 3
     assert bytes(dataset[b"a"]) == b"alpha"
+    assert bytes(dataset[b""]) == b""
     assert bytes(dataset.at(1)) == b"beta"
-    assert bytes(dataset.at(-1)) == b"beta"
+    assert bytes(dataset.at(-2)) == b"beta"
     assert bytes(dataset.at(np.int64(1))) == b"beta"
     assert b"a" in dataset
     assert b"missing" not in dataset
+    with pytest.raises(KeyError):
+        dataset[b"missing"]
+    with pytest.raises(IndexError):
+        dataset.at(3)
 
 
-def test_reopen_reads_settings_from_manifest(tmp_path: Path) -> None:
+def test_reopen_and_unpickle_read_settings_from_manifest(tmp_path: Path) -> None:
     path = tmp_path / "data"
-    BitcaskDataset.create(path, keyed=True, compression=None).extend([
-        (b"key", b"value")
-    ])
-
-    reopened = BitcaskDataset(path)
-    assert reopened.keyed is True
-    assert reopened.compression is None
-    assert bytes(reopened[b"key"]) == b"value"
-    assert bytes(reopened.key_at(0)) == b"key"
-
-
-def test_pickle_reopens_dataset(tmp_path: Path) -> None:
-    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset.create(path, keyed=True, compression=None)
     dataset.extend([(b"key", b"value")])
 
-    reopened = pickle.loads(pickle.dumps(dataset))
-
-    assert reopened.path == dataset.path
-    assert bytes(reopened[b"key"]) == b"value"
+    for reopened in (BitcaskDataset(path), pickle.loads(pickle.dumps(dataset))):
+        assert reopened.keyed is True
+        assert reopened.compression is None
+        assert bytes(reopened[b"key"]) == b"value"
+        assert bytes(reopened.key_at(0)) == b"key"
 
 
 def test_keyless_dataset(tmp_path: Path) -> None:
@@ -62,38 +56,21 @@ def test_keyless_dataset(tmp_path: Path) -> None:
     assert bytes(reopened.at(1)) == b"beta"
 
 
-def test_extend_uses_new_shards(tmp_path: Path) -> None:
-    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True, compression=None)
-    dataset.extend([(b"a", b"1")], max_shard_size=10)
-    dataset.extend([(b"b", b"2")], max_shard_size=10)
-
-    assert sorted(path.name for path in dataset.path.glob("0*")) == [
-        "000000.bin",
-        "000000.idx",
-        "000001.bin",
-        "000001.idx",
-    ]
-    assert bytes(dataset[b"a"]) == b"1"
-    assert bytes(dataset[b"b"]) == b"2"
-
-
-def test_shard_boundaries_and_oversized_record(tmp_path: Path) -> None:
+def test_shard_boundaries_and_new_shards_per_extend(tmp_path: Path) -> None:
     dataset = BitcaskDataset.create(tmp_path / "data", keyed=True, compression=None)
     dataset.extend(
         [(b"a", b"12"), (b"b", b"34"), (b"large", b"x" * 20)],
         max_shard_size=6,
     )
+    dataset.extend([(b"c", b"5")], max_shard_size=6)
 
-    assert len(list(dataset.path.glob("*.bin"))) == 2
+    assert sorted(path.name for path in dataset.path.glob("*.bin")) == [
+        "000000.bin",
+        "000001.bin",
+        "000002.bin",
+    ]
     assert bytes(dataset[b"large"]) == b"x" * 20
-
-
-def test_empty_key_and_value(tmp_path: Path) -> None:
-    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
-    dataset.extend([(b"", b""), (b"key", b"")])
-
-    assert bytes(dataset[b""]) == b""
-    assert bytes(dataset[b"key"]) == b""
+    assert bytes(dataset[b"c"]) == b"5"
 
 
 def test_duplicate_keys_are_rejected_without_commit(tmp_path: Path) -> None:
@@ -139,7 +116,7 @@ def test_failed_refresh_commits_nothing(tmp_path: Path) -> None:
     path = tmp_path / "data"
     BitcaskDataset.create(path, keyed=True, compression=None).extend([(b"a", b"1")])
     stale = BitcaskDataset(path)
-    # Commit a second shard that repeats key b"a", as a concurrent writer could.
+    # Commit a second shard that repeats key b"a", as a corrupt dataset could.
     for suffix in ("bin", "idx"):
         (path / f"000001.{suffix}").write_bytes(
             (path / f"000000.{suffix}").read_bytes()
@@ -218,12 +195,3 @@ def test_lz4_compresses_in_order(tmp_path: Path) -> None:
 def test_invalid_compression(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unsupported compression"):
         BitcaskDataset.create(tmp_path / "data", compression="gzip")  # type: ignore[arg-type]
-
-
-def test_missing_key_and_bad_position(tmp_path: Path) -> None:
-    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
-
-    with pytest.raises(KeyError):
-        dataset[b"missing"]
-    with pytest.raises(IndexError):
-        dataset.at(0)
