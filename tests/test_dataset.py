@@ -135,6 +135,26 @@ def test_stale_handle_does_not_overwrite_committed_shards(tmp_path: Path) -> Non
     assert bytes(reopened[b"b"]) == b"2"
 
 
+def test_failed_refresh_commits_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "data"
+    BitcaskDataset.create(path, keyed=True, compression=None).extend([(b"a", b"1")])
+    stale = BitcaskDataset(path)
+    # Commit a second shard that repeats key b"a", as a concurrent writer could.
+    for suffix in ("bin", "idx"):
+        (path / f"000001.{suffix}").write_bytes(
+            (path / f"000000.{suffix}").read_bytes()
+        )
+    (path / "manifest.json").write_text(
+        '{"keyed": true, "compression": null, "shards": 2}'
+    )
+
+    for _ in range(2):
+        with pytest.raises(ValueError, match="duplicate keys"):
+            stale.extend([(b"b", b"2")])
+    assert len(stale) == 1
+    assert not (path / "000002.bin").exists()
+
+
 def test_releasing_an_empty_value_does_not_affect_later_reads(tmp_path: Path) -> None:
     dataset = BitcaskDataset.create(tmp_path / "data")
     dataset.extend([b"", b""])

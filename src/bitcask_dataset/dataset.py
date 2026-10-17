@@ -132,11 +132,11 @@ class BitcaskDataset:
     def _add_shards(self, shard_count: int) -> None:
         if shard_count == len(self._shards):
             return
-        first_record = len(self)
         shards: list[memoryview] = []
         sizes = [self._sizes]
         shard_ids = [self._shard_ids]
         record_offsets = [self._record_offsets]
+        new_keys: list[bytes] = []
         for shard_id in range(len(self._shards), shard_count):
             data_path, index_path = _shard_paths(self.path, shard_id)
             shard_sizes = np.fromfile(index_path, dtype=INDEX_DTYPE).reshape(
@@ -147,22 +147,28 @@ class BitcaskDataset:
             if int(record_sizes.sum()) != len(shard):
                 raise ValueError(f"shard size does not match its index: {data_path}")
 
+            offsets = np.cumsum(record_sizes, dtype=np.uint64) - record_sizes
+            if self.keyed:
+                key_sizes = shard_sizes[:, 0].tolist()
+                new_keys += [
+                    bytes(shard[offset : offset + key_size])
+                    for offset, key_size in zip(offsets.tolist(), key_sizes)
+                ]
             shards.append(shard)
             sizes.append(shard_sizes)
             shard_ids.append(np.full(len(shard_sizes), shard_id, dtype=np.uint32))
-            record_offsets.append(
-                np.cumsum(record_sizes, dtype=np.uint64) - record_sizes
-            )
+            record_offsets.append(offsets)
 
+        # Validate everything before changing any state, so a failure leaves the
+        # handle as it was.
+        keys = {key: index for index, key in enumerate(new_keys, len(self))}
+        if len(keys) != len(new_keys) or not self._keys.keys().isdisjoint(keys):
+            raise ValueError("duplicate keys in dataset")
         self._shards += shards
         self._sizes = np.concatenate(sizes)
         self._shard_ids = np.concatenate(shard_ids)
         self._record_offsets = np.concatenate(record_offsets)
-        if self.keyed:
-            for index in range(first_record, len(self)):
-                self._keys[bytes(self.key_at(index))] = index
-            if len(self._keys) != len(self):
-                raise ValueError("duplicate keys in dataset")
+        self._keys.update(keys)
 
 
 def _validate_compression(compression: object) -> Compression:

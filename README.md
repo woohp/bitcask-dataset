@@ -74,13 +74,13 @@ dataset; `keyed` and `compression` are fixed at creation and read from the manif
 In keyed mode, `extend` takes `(key, value)` pairs and duplicate keys are errors. In
 keyless mode it takes values directly. Each `extend` is all-or-nothing and only
 creates new shards. Records aren't split, so a record over `max_shard_size` gets a
-shard to itself. Values are compressed on a thread pool, so don't modify a buffer after
-yielding it to `extend`.
+shard to itself. Values are compressed on a thread pool, so don't modify a value's
+buffer after yielding it to `extend`.
 
 Keys and values come back as read-only `memoryview`s, which `np.frombuffer` and
-`torch.frombuffer` can use without copying. Compressed values are views of freshly
-decompressed `bytes` (`value.obj`). With `compression=None`, values are read straight
-from the mmap with zero copies. Keys are always uncompressed. `at` and `key_at`
+`torch.frombuffer` can use without copying. Non-empty compressed values are views of
+freshly decompressed `bytes` (`value.obj`). With `compression=None`, values are read
+straight from the mmap with zero copies. Keys are always uncompressed. `at` and `key_at`
 support negative indexes. Key lookup and `key_at` raise `TypeError` in keyless mode.
 
 ## Format
