@@ -24,13 +24,20 @@ class BitcaskDataset:
     """An append-oriented, mmap-backed collection of byte blobs."""
 
     @classmethod
-    def create(cls, path: str | Path, *, keyed: bool = False, compression: Compression = "lz4") -> BitcaskDataset:
+    def create(
+        cls, path: str | Path, *, keyed: bool = False, compression: Compression = "lz4"
+    ) -> BitcaskDataset:
         """Create an empty dataset in a new or empty directory."""
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         if any(path.iterdir()):
             raise FileExistsError(f"directory is not empty: {path}")
-        _write_manifest(path, keyed=keyed, compression=_validate_compression(compression), shard_count=0)
+        _write_manifest(
+            path,
+            keyed=keyed,
+            compression=_validate_compression(compression),
+            shard_count=0,
+        )
         return cls(path)
 
     def __init__(self, path: str | Path) -> None:
@@ -46,8 +53,8 @@ class BitcaskDataset:
     ) -> None:
         """Add values, or unique key/value pairs for a keyed dataset, as new shards.
 
-        Keys and values must be C-contiguous buffers. Values are compressed in parallel, so their buffers
-        must not be modified after they are yielded.
+        Keys and values must be C-contiguous buffers. Values are compressed in
+        parallel, so their buffers must not be modified after they are yielded.
         """
         if max_shard_size <= 0:
             raise ValueError("max_shard_size must be positive")
@@ -58,7 +65,8 @@ class BitcaskDataset:
         workers = os.process_cpu_count() or 1
         with ThreadPoolExecutor(workers) as pool:
             if self.compression == "lz4":
-                # lz4 releases the GIL; buffersize bounds how many records are held in memory.
+                # lz4 releases the GIL; buffersize bounds how many records
+                # are held in memory.
                 records = pool.map(_compress, records, buffersize=2 * workers)
             shard_count = _write_shards(
                 self.path,
@@ -67,7 +75,12 @@ class BitcaskDataset:
                 first_shard_id=len(self._shards),
                 max_shard_size=max_shard_size,
             )
-        _write_manifest(self.path, keyed=self.keyed, compression=self.compression, shard_count=shard_count)
+        _write_manifest(
+            self.path,
+            keyed=self.keyed,
+            compression=self.compression,
+            shard_count=shard_count,
+        )
         self._add_shards(shard_count)
 
     def __len__(self) -> int:
@@ -96,7 +109,9 @@ class BitcaskDataset:
         if not self.keyed:
             raise TypeError("keys are disabled for this dataset")
         offset = int(self._record_offsets[index])
-        return self._shards[int(self._shard_ids[index])][offset : offset + int(self._sizes[index, 0])]
+        return self._shards[int(self._shard_ids[index])][
+            offset : offset + int(self._sizes[index, 0])
+        ]
 
     def __getstate__(self) -> Path:
         return self.path
@@ -119,10 +134,16 @@ class BitcaskDataset:
             return
         first_record = len(self)
         shards: list[memoryview] = []
-        sizes, shard_ids, record_offsets = [self._sizes], [self._shard_ids], [self._record_offsets]
+        sizes, shard_ids, record_offsets = (
+            [self._sizes],
+            [self._shard_ids],
+            [self._record_offsets],
+        )
         for shard_id in range(len(self._shards), shard_count):
             data_path, index_path = _shard_paths(self.path, shard_id)
-            shard_sizes = np.fromfile(index_path, dtype=INDEX_DTYPE).reshape(-1, self._sizes.shape[1])
+            shard_sizes = np.fromfile(index_path, dtype=INDEX_DTYPE).reshape(
+                -1, self._sizes.shape[1]
+            )
             record_sizes = shard_sizes.sum(axis=1, dtype=np.uint64)
             shard = _mmap_readonly(data_path)
             if int(record_sizes.sum()) != len(shard):
@@ -131,7 +152,9 @@ class BitcaskDataset:
             shards.append(shard)
             sizes.append(shard_sizes)
             shard_ids.append(np.full(len(shard_sizes), shard_id, dtype=np.uint32))
-            record_offsets.append(np.cumsum(record_sizes, dtype=np.uint64) - record_sizes)
+            record_offsets.append(
+                np.cumsum(record_sizes, dtype=np.uint64) - record_sizes
+            )
 
         self._shards += shards
         self._sizes = np.concatenate(sizes)
@@ -152,10 +175,18 @@ def _validate_compression(compression: object) -> Compression:
     raise ValueError(f"unsupported compression: {compression!r}")
 
 
-def _write_manifest(path: Path, *, keyed: bool, compression: Compression, shard_count: int) -> None:
+def _write_manifest(
+    path: Path, *, keyed: bool, compression: Compression, shard_count: int
+) -> None:
     temporary = path / f".{MANIFEST_NAME}.tmp"
     with temporary.open("wb") as file:
-        file.write(json.dumps({"keyed": keyed, "compression": compression, "shards": shard_count}).encode())
+        file.write(
+            json.dumps({
+                "keyed": keyed,
+                "compression": compression,
+                "shards": shard_count,
+            }).encode()
+        )
         _finish_files((file,))
     # New shard files must be durable before the manifest rename, which commits them.
     _fsync_directory(path)
@@ -166,8 +197,16 @@ def _write_manifest(path: Path, *, keyed: bool, compression: Compression, shard_
 def _read_manifest(path: Path) -> tuple[bool, Compression, int]:
     manifest_path = path / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text())
-    keyed, compression, shard_count = manifest["keyed"], manifest["compression"], manifest["shards"]
-    if not isinstance(keyed, bool) or not isinstance(shard_count, int) or shard_count < 0:
+    keyed, compression, shard_count = (
+        manifest["keyed"],
+        manifest["compression"],
+        manifest["shards"],
+    )
+    if (
+        not isinstance(keyed, bool)
+        or not isinstance(shard_count, int)
+        or shard_count < 0
+    ):
         raise ValueError(f"invalid manifest: {manifest_path}")
     return keyed, _validate_compression(compression), shard_count
 
@@ -222,7 +261,9 @@ def _write_shards(
                 raise ValueError("keys and encoded values must fit in uint32")
 
             record_size = len(key) + len(value)
-            if files is None or (shard_size and shard_size + record_size > max_shard_size):
+            if files is None or (
+                shard_size and shard_size + record_size > max_shard_size
+            ):
                 if files is not None:
                     _finish_files(files)
                 data_path, index_path = _shard_paths(path, shard_count)

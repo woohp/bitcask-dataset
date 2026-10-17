@@ -23,7 +23,9 @@ def test_create_extend_and_lookup(tmp_path: Path) -> None:
 
 def test_reopen_reads_settings_from_manifest(tmp_path: Path) -> None:
     path = tmp_path / "data"
-    BitcaskDataset.create(path, keyed=True, compression=None).extend([(b"key", b"value")])
+    BitcaskDataset.create(path, keyed=True, compression=None).extend([
+        (b"key", b"value")
+    ])
 
     reopened = BitcaskDataset(path)
     assert reopened.keyed is True
