@@ -1,24 +1,23 @@
-from __future__ import annotations
-
+import json
 import mmap
 import os
-import shutil
 import struct
-import tempfile
-from collections.abc import Buffer, Iterable
+from collections.abc import Buffer, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import BinaryIO, Literal, SupportsIndex
 
 import numpy as np
-import numpy.typing as npt
 from lz4 import block
 
 DEFAULT_MAX_SHARD_SIZE = 1 << 30
 MAX_FIELD_SIZE = np.iinfo(np.uint32).max
 INDEX_DTYPE = np.dtype("<u4")
 EMPTY_VIEW = memoryview(b"")
+MANIFEST_NAME = "manifest.json"
 
 type Entry = tuple[Buffer, Buffer]
+type Record = tuple[memoryview, bytes | memoryview]
 type Compression = Literal["lz4"] | None
 type Shard = mmap.mmap | memoryview
 
@@ -26,18 +25,19 @@ type Shard = mmap.mmap | memoryview
 class BitcaskDataset:
     """An append-oriented, mmap-backed collection of byte blobs."""
 
-    def __init__(
-        self,
-        path: str | Path,
-        *,
-        keyed: bool = False,
-        compression: Compression = "lz4",
-    ) -> None:
+    @classmethod
+    def create(cls, path: str | Path, *, keyed: bool = False, compression: Compression = "lz4") -> BitcaskDataset:
+        """Create an empty dataset in a new or empty directory."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        if any(path.iterdir()):
+            raise FileExistsError(f"directory is not empty: {path}")
+        _write_manifest(path, keyed=keyed, compression=_validate_compression(compression), shard_count=0)
+        return cls(path)
+
+    def __init__(self, path: str | Path) -> None:
+        """Open an existing dataset."""
         self.path = Path(path)
-        self.keyed = keyed
-        self.compression = _validate_compression(compression)
-        if not self.path.exists() or not any(self.path.iterdir()):
-            _initialize_empty_dataset(self.path)
         self._load()
 
     def extend(
@@ -46,20 +46,28 @@ class BitcaskDataset:
         *,
         max_shard_size: int = DEFAULT_MAX_SHARD_SIZE,
     ) -> None:
-        """Add values, or unique key/value pairs for a keyed dataset."""
+        """Add values, or unique key/value pairs for a keyed dataset, as new shards.
+
+        Values are compressed in parallel, so entries must not be modified after they are yielded.
+        """
         if max_shard_size <= 0:
             raise ValueError("max_shard_size must be positive")
 
-        _extend_dataset(
-            self.path,
-            entries,
-            keyed=self.keyed,
-            compression=self.compression,
-            existing_keys=self._keys,
-            first_shard_id=len(self._shards),
-            max_shard_size=max_shard_size,
-        )
-        self._load()
+        records = _records(entries, keyed=self.keyed, existing_keys=self._keys)
+        workers = os.process_cpu_count() or 1
+        with ThreadPoolExecutor(workers) as pool:
+            if self.compression == "lz4":
+                # lz4 releases the GIL; buffersize bounds how many records are held in memory.
+                records = pool.map(_compress, records, buffersize=2 * workers)
+            shard_count = _write_shards(
+                self.path,
+                records,
+                keyed=self.keyed,
+                first_shard_id=len(self._shards),
+                max_shard_size=max_shard_size,
+            )
+        _write_manifest(self.path, keyed=self.keyed, compression=self.compression, shard_count=shard_count)
+        self._add_shards(shard_count)
 
     def __len__(self) -> int:
         return self._sizes.shape[0]
@@ -87,36 +95,44 @@ class BitcaskDataset:
             raise TypeError("keys are disabled for this dataset")
         return self._key_at(index)
 
-    def __getstate__(self) -> tuple[Path, bool, Compression]:
-        return self.path, self.keyed, self.compression
+    def __getstate__(self) -> Path:
+        return self.path
 
-    def __setstate__(self, state: tuple[Path, bool, Compression]) -> None:
-        self.path, self.keyed, self.compression = state
+    def __setstate__(self, state: Path) -> None:
+        self.path = state
         self._load()
 
     def _load(self) -> None:
-        index_path = self.path / "index.bin"
-        columns = 2 if self.keyed else 1
-        if index_path.stat().st_size:
-            raw_sizes = np.memmap(index_path, dtype=INDEX_DTYPE, mode="r")
-            self._sizes = raw_sizes.reshape(-1, columns)
-        else:
-            self._sizes = np.empty((0, columns), dtype=INDEX_DTYPE)
-
-        shard_paths = _shard_paths(self.path / "shards")
-        shard_sizes = np.asarray([path.stat().st_size for path in shard_paths], dtype=np.uint64)
-        shard_ends = np.cumsum(shard_sizes)
-        expected_size = int(self._sizes.sum(dtype=np.uint64))
-        # Shards past the indexed data are left over from an interrupted extend, which the next extend replaces.
-        shard_count = int(np.searchsorted(shard_ends, expected_size)) + (expected_size > 0)
-        if shard_count > len(shard_paths) or (shard_count and shard_ends[shard_count - 1] != expected_size):
-            raise ValueError(f"shard data does not match the {expected_size} bytes in the index")
-
-        self._shards = [_mmap_readonly(path) for path in shard_paths[:shard_count]]
-        self._shard_ids, self._record_offsets = _build_locations(self._sizes, shard_sizes[:shard_count])
+        self.keyed, self.compression, shard_count = _read_manifest(self.path)
+        self._shards: list[Shard] = []
+        self._sizes = np.empty((0, 2 if self.keyed else 1), dtype=INDEX_DTYPE)
+        self._shard_ids = np.empty(0, dtype=np.uint32)
+        self._record_offsets = np.empty(0, dtype=np.uint64)
         self._keys: dict[bytes, int] = {}
+        self._add_shards(shard_count)
+
+    def _add_shards(self, shard_count: int) -> None:
+        first_record = len(self)
+        sizes, shard_ids, record_offsets = [self._sizes], [self._shard_ids], [self._record_offsets]
+        for shard_id in range(len(self._shards), shard_count):
+            data_path, index_path = _shard_paths(self.path, shard_id)
+            shard_sizes = np.fromfile(index_path, dtype=INDEX_DTYPE).reshape(-1, self._sizes.shape[1])
+            record_sizes = shard_sizes.sum(axis=1, dtype=np.uint64)
+            shard = _mmap_readonly(data_path)
+            if int(record_sizes.sum()) != len(shard):
+                raise ValueError(f"shard size does not match its index: {data_path}")
+
+            self._shards.append(shard)
+            sizes.append(shard_sizes)
+            shard_ids.append(np.full(len(shard_sizes), shard_id, dtype=np.uint32))
+            record_offsets.append(np.cumsum(record_sizes) - record_sizes)
+
+        self._sizes = np.concatenate(sizes)
+        self._shard_ids = np.concatenate(shard_ids)
+        self._record_offsets = np.concatenate(record_offsets)
         if self.keyed:
-            self._keys = {bytes(self._key_at(index)): index for index in range(len(self))}
+            for index in range(first_record, len(self)):
+                self._keys[bytes(self._key_at(index))] = index
             if len(self._keys) != len(self):
                 raise ValueError("duplicate keys in dataset")
 
@@ -144,7 +160,7 @@ class BitcaskDataset:
         return value
 
 
-def _validate_compression(compression: str | None) -> Compression:
+def _validate_compression(compression: object) -> Compression:
     if compression == "lz4":
         return "lz4"
     if compression is None:
@@ -152,136 +168,105 @@ def _validate_compression(compression: str | None) -> Compression:
     raise ValueError(f"unsupported compression: {compression!r}")
 
 
-def _initialize_empty_dataset(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "shards").mkdir()
-    (path / "index.bin").touch()
+def _write_manifest(path: Path, *, keyed: bool, compression: Compression, shard_count: int) -> None:
+    temporary = path / f".{MANIFEST_NAME}.tmp"
+    with temporary.open("wb") as file:
+        file.write(json.dumps({"keyed": keyed, "compression": compression, "shards": shard_count}).encode())
+        _finish_files((file,))
+    # New shard files must be durable before the manifest rename, which commits them.
+    _fsync_directory(path)
+    os.replace(temporary, path / MANIFEST_NAME)
+    _fsync_directory(path)
 
 
-def _extend_dataset(
-    path: Path,
+def _read_manifest(path: Path) -> tuple[bool, Compression, int]:
+    manifest_path = path / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    keyed, compression, shard_count = manifest["keyed"], manifest["compression"], manifest["shards"]
+    if not isinstance(keyed, bool) or not isinstance(shard_count, int) or shard_count < 0:
+        raise ValueError(f"invalid manifest: {manifest_path}")
+    return keyed, _validate_compression(compression), shard_count
+
+
+def _records(
     entries: Iterable[Buffer | Entry],
     *,
     keyed: bool,
-    compression: Compression,
     existing_keys: dict[bytes, int],
+) -> Iterator[Record]:
+    new_keys: set[bytes] = set()
+    for entry in entries:
+        if not keyed:
+            if not isinstance(entry, Buffer):
+                raise TypeError("keyless datasets require an iterable of buffers")
+            yield EMPTY_VIEW, _as_bytes_view(entry)
+            continue
+
+        key, value = _entry_views(entry)
+        key_copy = bytes(key)
+        if key_copy in existing_keys or key_copy in new_keys:
+            raise ValueError(f"duplicate key: {key_copy!r}")
+        new_keys.add(key_copy)
+        yield key, value
+
+
+def _compress(record: Record) -> Record:
+    key, value = record
+    if not len(value):
+        return record
+    return key, block.compress(value, mode="high_compression", store_size=True)
+
+
+def _write_shards(
+    path: Path,
+    records: Iterable[Record],
+    *,
+    keyed: bool,
     first_shard_id: int,
     max_shard_size: int,
-) -> None:
-    shards_path = path / "shards"
-    temporary_shards: list[tuple[Path, Path]] = []
-    new_keys: set[bytes] = set()
-    shard_file = None
+) -> int:
+    """Write records to new, uncommitted shard files and return the new shard count."""
+    shard_count = first_shard_id
+    written: list[Path] = []
+    files: tuple[BinaryIO, BinaryIO] | None = None
     shard_size = 0
-    next_shard_id = first_shard_id
-
-    index_fd, index_name = tempfile.mkstemp(prefix=".index-", dir=path)
-    index_temp = Path(index_name)
-
     try:
-        with os.fdopen(index_fd, "wb") as index_file:
-            with (path / "index.bin").open("rb") as old_index:
-                shutil.copyfileobj(old_index, index_file)
+        for key, value in records:
+            if key.nbytes > MAX_FIELD_SIZE or len(value) > MAX_FIELD_SIZE:
+                raise ValueError("keys and encoded values must fit in uint32")
 
-            for entry in entries:
-                if keyed:
-                    key, value = _entry_views(entry)
-                    key_copy = bytes(key)
-                    if key_copy in existing_keys or key_copy in new_keys:
-                        raise ValueError(f"duplicate key: {key_copy!r}")
-                    new_keys.add(key_copy)
-                    if key.nbytes > MAX_FIELD_SIZE:
-                        raise ValueError("key must fit in uint32")
-                else:
-                    if not isinstance(entry, Buffer):
-                        raise TypeError("keyless datasets require an iterable of buffers")
-                    key = EMPTY_VIEW
-                    value = _as_bytes_view(entry)
+            record_size = key.nbytes + len(value)
+            if files is None or (shard_size and shard_size + record_size > max_shard_size):
+                if files is not None:
+                    _finish_files(files)
+                data_path, index_path = _shard_paths(path, shard_count)
+                written += [data_path, index_path]
+                files = data_path.open("wb"), index_path.open("wb")
+                shard_count += 1
+                shard_size = 0
 
-                stored_value: bytes | memoryview
-                if compression == "lz4" and value.nbytes:
-                    stored_value = block.compress(value, mode="high_compression", store_size=True)
-                else:
-                    stored_value = value
-                stored_value_size = len(stored_value)
-                if stored_value_size > MAX_FIELD_SIZE:
-                    raise ValueError("encoded value must fit in uint32")
+            data_file, index_file = files
+            data_file.write(key)
+            data_file.write(value)
+            shard_size += record_size
+            if keyed:
+                index_file.write(struct.pack("<II", key.nbytes, len(value)))
+            else:
+                index_file.write(struct.pack("<I", len(value)))
 
-                record_size = key.nbytes + stored_value_size
-                if shard_file is None or (shard_size and shard_size + record_size > max_shard_size):
-                    if shard_file is not None:
-                        _finish_file(shard_file)
-                    final_path = shards_path / f"{next_shard_id:06d}.bin"
-                    fd, temp_name = tempfile.mkstemp(prefix=f".{next_shard_id:06d}-", dir=shards_path)
-                    shard_file = os.fdopen(fd, "wb")
-                    temporary_shards.append((Path(temp_name), final_path))
-                    next_shard_id += 1
-                    shard_size = 0
-
-                shard_file.write(key)
-                shard_file.write(stored_value)
-                shard_size += record_size
-                if keyed:
-                    index_file.write(struct.pack("<II", key.nbytes, stored_value_size))
-                else:
-                    index_file.write(struct.pack("<I", stored_value_size))
-
-            if shard_file is not None:
-                _finish_file(shard_file)
-                shard_file = None
-
-            index_file.flush()
-            os.fsync(index_file.fileno())
-
-        # Shard renames must be durable before the index rename, which commits the extend.
-        for temporary, final in temporary_shards:
-            os.replace(temporary, final)
-        _fsync_directory(shards_path)
-        os.replace(index_temp, path / "index.bin")
-        _fsync_directory(path)
+        if files is not None:
+            _finish_files(files)
     except BaseException:
-        if shard_file is not None:
-            shard_file.close()
-        index_temp.unlink(missing_ok=True)
-        for temporary, _ in temporary_shards:
-            temporary.unlink(missing_ok=True)
+        for file in files or ():
+            file.close()
+        for written_path in written:
+            written_path.unlink(missing_ok=True)
         raise
+    return shard_count
 
 
-def _build_locations(
-    sizes: npt.NDArray[np.uint32],
-    shard_sizes: npt.NDArray[np.uint64],
-) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint64]]:
-    record_sizes = sizes.sum(axis=1, dtype=np.uint64)
-    global_starts = np.cumsum(record_sizes) - record_sizes
-    shard_ends = np.cumsum(shard_sizes)
-
-    shard_ids = np.zeros(record_sizes.size, dtype=np.uint32)
-    record_offsets = np.zeros(record_sizes.size, dtype=np.uint64)
-    nonempty = record_sizes != 0
-    resolved_ids = np.searchsorted(shard_ends, global_starts[nonempty], side="right")
-    resolved_offsets = global_starts[nonempty] - (shard_ends - shard_sizes)[resolved_ids]
-    if np.any(resolved_offsets + record_sizes[nonempty] > shard_sizes[resolved_ids]):
-        raise ValueError("an indexed record crosses a shard boundary")
-
-    shard_ids[nonempty] = resolved_ids
-    record_offsets[nonempty] = resolved_offsets
-    return shard_ids, record_offsets
-
-
-def _shard_paths(path: Path) -> list[Path]:
-    numbered: list[tuple[int, Path]] = []
-    for candidate in path.iterdir():
-        if candidate.name.startswith("."):
-            continue
-        if candidate.suffix != ".bin" or not candidate.stem.isdecimal():
-            raise ValueError(f"invalid shard filename: {candidate.name}")
-        numbered.append((int(candidate.stem), candidate))
-
-    numbered.sort()
-    if [number for number, _ in numbered] != list(range(len(numbered))):
-        raise ValueError("shard numbers must be contiguous starting at zero")
-    return [candidate for _, candidate in numbered]
+def _shard_paths(path: Path, shard_id: int) -> tuple[Path, Path]:
+    return path / f"{shard_id:06d}.bin", path / f"{shard_id:06d}.idx"
 
 
 def _mmap_readonly(path: Path) -> Shard:
@@ -310,10 +295,11 @@ def _as_bytes_view(value: Buffer) -> memoryview:
     return view.cast("B")
 
 
-def _finish_file(file: BinaryIO) -> None:
-    file.flush()
-    os.fsync(file.fileno())
-    file.close()
+def _finish_files(files: Iterable[BinaryIO]) -> None:
+    for file in files:
+        file.flush()
+        os.fsync(file.fileno())
+        file.close()
 
 
 def _fsync_directory(path: Path) -> None:

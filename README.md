@@ -1,9 +1,22 @@
 # bitcask-dataset
 
-Basically a disk-backed collection of byte blobs, optionally keyed by bytes. Data is
-append-only, split into shards, LZ4-compressed, and mmap'd when opened.
+A disk-backed blob store that's a good fit if:
 
-This is mostly for training data where serialization is somebody else's problem.
+- you mostly do random-access reads, e.g. shuffled training data,
+- values are biggish blobs (KiB to MiB) and keys are small,
+- you add data in batches and never update or delete.
+
+Each `extend` writes new shard files and never touches existing ones. Opening a
+dataset mmaps the shards as one logical file, so a lookup is a dict hit and a slice.
+Values are LZ4-compressed by default, in parallel on write.
+
+Because old shards never change, keeping a copy elsewhere (say, S3) after an `extend`
+means uploading only the new shards and the small manifest, never the whole dataset.
+
+Probably not for you if you need deletes or overwrites, concurrent writers, or more
+keys than fit comfortably in RAM in every reader process.
+
+Serialization is your problem: values are just bytes.
 
 ## Install
 
@@ -16,12 +29,13 @@ pip install bitcask-dataset
 ```python
 from bitcask_dataset import BitcaskDataset
 
-ds = BitcaskDataset("my-dataset", keyed=True)  # creates the directory if needed
+ds = BitcaskDataset.create("my-dataset", keyed=True)
 ds.extend([
     (b"image/1", image_bytes),
     (b"image/2", more_image_bytes),
 ])
 
+ds = BitcaskDataset("my-dataset")  # settings come from the manifest
 value = ds[b"image/1"]  # read-only memoryview of the decompressed bytes
 
 # insertion order is available too
@@ -35,7 +49,7 @@ b"image/1" in ds
 Keys are optional:
 
 ```python
-ds = BitcaskDataset("my-keyless-dataset")
+ds = BitcaskDataset.create("my-keyless-dataset")
 ds.extend([image_bytes, more_image_bytes])
 value = ds.at(0)
 ```
@@ -45,7 +59,8 @@ Keys and values can be anything with the buffer protocol.
 ## API
 
 ```python
-BitcaskDataset(path, keyed=False, compression="lz4")
+BitcaskDataset.create(path, keyed=False, compression="lz4")
+BitcaskDataset(path)
 ds.extend(entries, max_shard_size=1 << 30)
 ds[key]
 ds.at(index)
@@ -54,57 +69,56 @@ len(ds)
 key in ds
 ```
 
-A missing or empty path is initialized. An existing non-dataset directory is an
-error.
+`create` needs a missing or empty directory. `BitcaskDataset(path)` opens an existing
+dataset; `keyed` and `compression` are fixed at creation and read from the manifest.
 
 In keyed mode, `extend` takes `(key, value)` pairs and duplicate keys are errors. In
-keyless mode it takes values directly. It only creates new shards; it never adds data
-to an old one. Records aren't split, so a record over `max_shard_size` gets a shard
-to itself.
+keyless mode it takes values directly. Each `extend` is all-or-nothing and only
+creates new shards. Records aren't split, so a record over `max_shard_size` gets a
+shard to itself. Values are compressed on a thread pool, so don't modify a buffer after
+yielding it to `extend`.
 
 Keys and values come back as read-only `memoryview`s, which `np.frombuffer` and
 `torch.frombuffer` can use without copying. Compressed values are views of freshly
-decompressed `bytes` (`value.obj`). Pass `compression=None` to store values
-uncompressed and read them straight from the mmap with zero copies. Keys are always
-uncompressed. `at` and `key_at` support negative indexes. Key lookup and `key_at`
-raise `TypeError` in keyless mode.
-
-There is no metadata file yet, so remember to use the same `keyed` and `compression`
-arguments every time you open a dataset. The defaults are `keyed=False` and
-`compression="lz4"`. Opening a dataset with the wrong settings may misread it.
+decompressed `bytes` (`value.obj`). With `compression=None`, values are read straight
+from the mmap with zero copies. Keys are always uncompressed. `at` and `key_at`
+support negative indexes. Key lookup and `key_at` raise `TypeError` in keyless mode.
 
 ## Format
 
 ```text
 my-dataset/
-    index.bin
-    shards/
-        000000.bin
-        000001.bin
+    manifest.json
+    000000.bin
+    000000.idx
+    000001.bin
+    000001.idx
 ```
 
-The keyed index is little-endian `uint32` pairs:
+`manifest.json` holds the settings and how many shards are committed:
 
-```text
-key_size, value_size, key_size, value_size, ...
+```json
+{"keyed": true, "compression": "lz4", "shards": 2}
 ```
 
-The keyless index is one `uint32` stored-value size per item. Keyed shards are
-`key || value || key || value ...`; keyless shards only contain values. Values are
-independent LZ4 blocks using high-compression mode, with the original size in each
-block. Empty values stay empty. There are no record headers or padding. NumPy does a
-cumsum at startup and works out the shard/offset for each record.
+Each `.idx` lists its shard's records as little-endian `uint32` sizes: `key_size,
+value_size` pairs when keyed, one stored-value size per record when keyless. Keyed
+shards are `key || value || key || value ...`; keyless shards only contain values.
+There are no record headers or padding. Values are independent LZ4 blocks using
+high-compression mode, with the original size in each block. Empty values stay empty.
 
-Keyed datasets copy keys into a Python dict at startup. Each key and uncompressed
-value is limited to `2**32 - 1` bytes.
+Rewriting the manifest commits an `extend`, so shard files it doesn't list are
+leftovers from an interrupted `extend`; they're ignored and overwritten later. When
+copying a dataset, copy the manifest last.
+
+Keyed datasets copy keys into a Python dict at startup. Each key and stored value is
+limited to `2**32 - 1` bytes.
 
 ## Missing stuff
 
-An interrupted `extend` can leave extra shard files behind. They're ignored when
-opening and replaced by the next `extend`.
-
-No delete, overwrite, compaction, or concurrent writers. Also not
-actually an implementation of the Bitcask paper.
+No delete, overwrite, compaction, or concurrent writers. Also not actually an
+implementation of the Bitcask paper, though per-shard indexes are close to its hint
+files.
 
 ## Dev
 

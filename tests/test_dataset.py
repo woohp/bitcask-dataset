@@ -8,7 +8,7 @@ from bitcask_dataset import BitcaskDataset
 
 
 def test_create_extend_and_lookup(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
     dataset.extend([(b"a", b"alpha"), (b"b", b"beta")])
 
     assert len(dataset) == 2
@@ -20,17 +20,19 @@ def test_create_extend_and_lookup(tmp_path: Path) -> None:
     assert b"missing" not in dataset
 
 
-def test_reopen(tmp_path: Path) -> None:
+def test_reopen_reads_settings_from_manifest(tmp_path: Path) -> None:
     path = tmp_path / "data"
-    BitcaskDataset(path, keyed=True).extend([(b"key", b"value")])
+    BitcaskDataset.create(path, keyed=True, compression=None).extend([(b"key", b"value")])
 
-    reopened = BitcaskDataset(path, keyed=True)
+    reopened = BitcaskDataset(path)
+    assert reopened.keyed is True
+    assert reopened.compression is None
     assert bytes(reopened[b"key"]) == b"value"
     assert bytes(reopened.key_at(0)) == b"key"
 
 
 def test_pickle_reopens_dataset(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
     dataset.extend([(b"key", b"value")])
 
     reopened = pickle.loads(pickle.dumps(dataset))
@@ -41,7 +43,7 @@ def test_pickle_reopens_dataset(tmp_path: Path) -> None:
 
 def test_keyless_dataset(tmp_path: Path) -> None:
     path = tmp_path / "data"
-    dataset = BitcaskDataset(path, keyed=False)
+    dataset = BitcaskDataset.create(path)
     dataset.extend([b"alpha", b"beta", b""])
 
     assert len(dataset) == 3
@@ -53,36 +55,38 @@ def test_keyless_dataset(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="keys are disabled"):
         dataset.key_at(0)
 
-    reopened = BitcaskDataset(path, keyed=False)
+    reopened = BitcaskDataset(path)
     assert bytes(reopened.at(1)) == b"beta"
 
 
 def test_extend_uses_new_shards(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True, compression=None)
     dataset.extend([(b"a", b"1")], max_shard_size=10)
     dataset.extend([(b"b", b"2")], max_shard_size=10)
 
-    assert sorted(path.name for path in (dataset.path / "shards").glob("*.bin")) == [
+    assert sorted(path.name for path in dataset.path.glob("0*")) == [
         "000000.bin",
+        "000000.idx",
         "000001.bin",
+        "000001.idx",
     ]
     assert bytes(dataset[b"a"]) == b"1"
     assert bytes(dataset[b"b"]) == b"2"
 
 
 def test_shard_boundaries_and_oversized_record(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True, compression=None)
     dataset.extend(
         [(b"a", b"12"), (b"b", b"34"), (b"large", b"x" * 20)],
         max_shard_size=6,
     )
 
-    assert len(list((dataset.path / "shards").glob("*.bin"))) == 2
+    assert len(list(dataset.path.glob("*.bin"))) == 2
     assert bytes(dataset[b"large"]) == b"x" * 20
 
 
 def test_empty_key_and_value(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
     dataset.extend([(b"", b""), (b"key", b"")])
 
     assert bytes(dataset[b""]) == b""
@@ -90,58 +94,62 @@ def test_empty_key_and_value(tmp_path: Path) -> None:
 
 
 def test_duplicate_keys_are_rejected_without_commit(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
     dataset.extend([(b"a", b"old")])
 
     with pytest.raises(ValueError, match="duplicate key"):
         dataset.extend([(b"b", b"new"), (b"a", b"replacement")])
 
-    reopened = BitcaskDataset(dataset.path, keyed=True)
+    reopened = BitcaskDataset(dataset.path)
     assert len(reopened) == 1
     assert bytes(reopened[b"a"]) == b"old"
     assert b"b" not in reopened
+    assert not (dataset.path / "000001.bin").exists()
 
 
-def test_leftover_shard_from_interrupted_extend(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
+def test_uncommitted_shard_is_ignored_and_replaced(tmp_path: Path) -> None:
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True, compression=None)
     dataset.extend([(b"a", b"1")])
-    (dataset.path / "shards" / "000001.bin").write_bytes(b"orphan")
+    (dataset.path / "000001.bin").write_bytes(b"orphan")
+    (dataset.path / "000001.idx").write_bytes(b"junk")
 
-    reopened = BitcaskDataset(dataset.path, keyed=True, compression=None)
+    reopened = BitcaskDataset(dataset.path)
+    assert len(reopened) == 1
     reopened.extend([(b"b", b"2")])
 
-    assert bytes(reopened[b"a"]) == b"1"
-    assert bytes(BitcaskDataset(dataset.path, keyed=True, compression=None)[b"b"]) == b"2"
+    assert bytes(BitcaskDataset(dataset.path)[b"b"]) == b"2"
 
 
-def test_invalid_existing_directory(tmp_path: Path) -> None:
+def test_create_requires_empty_directory(tmp_path: Path) -> None:
     path = tmp_path / "data"
     path.mkdir()
     (path / "other").write_text("not a dataset")
 
+    with pytest.raises(FileExistsError):
+        BitcaskDataset.create(path)
     with pytest.raises(FileNotFoundError):
-        BitcaskDataset(path, keyed=True)
+        BitcaskDataset(path)
 
 
-def test_malformed_index(tmp_path: Path) -> None:
-    path = tmp_path / "data"
-    (path / "shards").mkdir(parents=True)
-    (path / "index.bin").write_bytes(b"bad")
+def test_shard_not_matching_its_index(tmp_path: Path) -> None:
+    dataset = BitcaskDataset.create(tmp_path / "data", compression=None)
+    dataset.extend([b"value"])
+    (dataset.path / "000000.bin").write_bytes(b"val")
 
-    with pytest.raises(ValueError, match="multiple of the data-type size"):
-        BitcaskDataset(path, keyed=True)
+    with pytest.raises(ValueError, match="does not match its index"):
+        BitcaskDataset(dataset.path)
 
 
 def test_index_contains_uint32_sizes(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True, compression=None)
     dataset.extend([(b"abc", b"value")])
 
-    sizes = np.fromfile(dataset.path / "index.bin", dtype="<u4").reshape(-1, 2)
+    sizes = np.fromfile(dataset.path / "000000.idx", dtype="<u4").reshape(-1, 2)
     np.testing.assert_array_equal(sizes, [[3, 5]])
 
 
 def test_uncompressed_values_are_zero_copy(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", compression=None)
+    dataset = BitcaskDataset.create(tmp_path / "data", compression=None)
     dataset.extend([b"value"])
 
     value = dataset.at(0)
@@ -149,23 +157,23 @@ def test_uncompressed_values_are_zero_copy(tmp_path: Path) -> None:
     assert bytes(value) == b"value"
 
 
-def test_lz4_high_compression(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data")
-    value = b"repetitive" * 10_000
-    dataset.extend([value])
+def test_lz4_compresses_in_order(tmp_path: Path) -> None:
+    dataset = BitcaskDataset.create(tmp_path / "data")
+    values = [bytes([i]) * 10_000 for i in range(100)]
+    dataset.extend(values)
 
-    stored_size = int(np.fromfile(dataset.path / "index.bin", dtype="<u4")[0])
-    assert stored_size < len(value)
-    assert dataset.at(0) == value
+    stored_size = int(np.fromfile(dataset.path / "000000.idx", dtype="<u4")[0])
+    assert stored_size < len(values[0])
+    assert [bytes(dataset.at(i)) for i in range(len(values))] == values
 
 
 def test_invalid_compression(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unsupported compression"):
-        BitcaskDataset(tmp_path / "data", compression="gzip")  # type: ignore[arg-type]
+        BitcaskDataset.create(tmp_path / "data", compression="gzip")  # type: ignore[arg-type]
 
 
 def test_missing_key_and_bad_position(tmp_path: Path) -> None:
-    dataset = BitcaskDataset(tmp_path / "data", keyed=True)
+    dataset = BitcaskDataset.create(tmp_path / "data", keyed=True)
 
     with pytest.raises(KeyError):
         dataset[b"missing"]
