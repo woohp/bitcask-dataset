@@ -2,21 +2,19 @@
 
 A disk-backed blob store that's a good fit if:
 
-- you mostly do random-access reads, e.g. shuffled training data,
+- you mostly do random-access reads, e.g. ML training data,
 - values are biggish blobs (KiB to MiB) and keys are small,
 - you add data in batches and never update or delete.
 
-Each `extend` writes new shard files and never touches existing ones. Opening a
-dataset mmaps the shards as one logical file, so a lookup is a dict hit and a slice.
-Values are LZ4-compressed by default, in parallel on write.
+Each `extend` writes new shard files. Opening a dataset mmaps the shards as one logical
+file, so lookups are fast and efficient.
+Values are optionally LZ4-compressed (on by default).
 
 Because old shards never change, keeping a copy elsewhere (say, S3) after an `extend`
-means uploading only the new shards and the small manifest, never the whole dataset.
+means uploading only the new shards and the manifest, and never the whole dataset.
 
-Probably not for you if you need deletes or overwrites, concurrent writers, or more
-keys than fit comfortably in RAM in every reader process.
-
-Serialization is your problem: values are just bytes.
+Not a good fit if you need deletes, overwrites, concurrent writers, or more keys
+than what your RAM can fit.
 
 ## Install
 
