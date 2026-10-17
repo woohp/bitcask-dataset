@@ -7,7 +7,7 @@ import struct
 import tempfile
 from collections.abc import Buffer, Iterable
 from pathlib import Path
-from typing import BinaryIO, Literal, SupportsIndex, cast, overload
+from typing import BinaryIO, Literal, SupportsIndex
 
 import numpy as np
 import numpy.typing as npt
@@ -20,39 +20,11 @@ EMPTY_VIEW = memoryview(b"")
 
 type Entry = tuple[Buffer, Buffer]
 type Compression = Literal["lz4"] | None
-type UIntArray = npt.NDArray[np.unsignedinteger]
 type Shard = mmap.mmap | memoryview
 
 
-class BitcaskDataset[ValueT: Buffer]:
+class BitcaskDataset:
     """An append-oriented, mmap-backed collection of byte blobs."""
-
-    @overload
-    def __init__(
-        self: BitcaskDataset[bytes],
-        path: str | Path,
-        *,
-        keyed: bool = False,
-        compression: Literal["lz4"] = "lz4",
-    ) -> None: ...
-
-    @overload
-    def __init__(
-        self: BitcaskDataset[memoryview],
-        path: str | Path,
-        *,
-        keyed: bool = False,
-        compression: None,
-    ) -> None: ...
-
-    @overload
-    def __init__(
-        self: BitcaskDataset[bytes | memoryview],
-        path: str | Path,
-        *,
-        keyed: bool = False,
-        compression: Compression,
-    ) -> None: ...
 
     def __init__(
         self,
@@ -63,7 +35,7 @@ class BitcaskDataset[ValueT: Buffer]:
     ) -> None:
         self.path = Path(path)
         self.keyed = keyed
-        self._compression = _validate_compression(compression)
+        self.compression = _validate_compression(compression)
         if not self.path.exists() or not any(self.path.iterdir()):
             _initialize_empty_dataset(self.path)
         self._load()
@@ -95,11 +67,7 @@ class BitcaskDataset[ValueT: Buffer]:
     def __contains__(self, key: object) -> bool:
         return self.keyed and isinstance(key, Buffer) and _as_key(key) in self._keys
 
-    @property
-    def compression(self) -> Compression:
-        return self._compression
-
-    def __getitem__(self, key: Buffer) -> ValueT:
+    def __getitem__(self, key: Buffer) -> bytes | memoryview:
         if not self.keyed:
             raise TypeError("key lookup is disabled for this dataset")
         normalized = _as_key(key)
@@ -109,7 +77,7 @@ class BitcaskDataset[ValueT: Buffer]:
             raise KeyError(normalized) from None
         return self._value_at(index)
 
-    def at(self, index: SupportsIndex) -> ValueT:
+    def at(self, index: SupportsIndex) -> bytes | memoryview:
         """Return a value by insertion position."""
         return self._value_at(index)
 
@@ -123,7 +91,7 @@ class BitcaskDataset[ValueT: Buffer]:
         return self.path, self.keyed, self.compression
 
     def __setstate__(self, state: tuple[Path, bool, Compression]) -> None:
-        self.path, self.keyed, self._compression = state
+        self.path, self.keyed, self.compression = state
         self._load()
 
     def _load(self) -> None:
@@ -159,21 +127,20 @@ class BitcaskDataset[ValueT: Buffer]:
         offset = int(self._record_offsets[index])
         return memoryview(self._shards[shard_id])[offset : offset + key_size]
 
-    def _value_at(self, index: SupportsIndex) -> ValueT:
+    def _value_at(self, index: SupportsIndex) -> bytes | memoryview:
         key_size = int(self._sizes[index, 0]) if self.keyed else 0
         value_column = 1 if self.keyed else 0
         value_size = int(self._sizes[index, value_column])
         if value_size == 0:
-            empty = b"" if self.compression else EMPTY_VIEW
-            return cast(ValueT, empty)
+            return b"" if self.compression else EMPTY_VIEW
 
         shard_id = int(self._shard_ids[index])
         offset = int(self._record_offsets[index]) + key_size
         value = memoryview(self._shards[shard_id])[offset : offset + value_size]
         if self.compression == "lz4":
-            decompressed = block.decompress(value)  # type: ignore[attr-defined]
-            return cast(ValueT, decompressed)
-        return cast(ValueT, value)
+            decompressed: bytes = block.decompress(value)
+            return decompressed
+        return value
 
 
 def _validate_compression(compression: str | None) -> Compression:
@@ -232,9 +199,7 @@ def _extend_dataset(
 
                 stored_value: bytes | memoryview
                 if compression == "lz4" and value.nbytes:
-                    stored_value = block.compress(  # type: ignore[attr-defined]
-                        value, mode="high_compression", store_size=True
-                    )
+                    stored_value = block.compress(value, mode="high_compression", store_size=True)
                 else:
                     stored_value = value
                 stored_value_size = len(stored_value)

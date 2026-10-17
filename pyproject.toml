@@ -36,7 +36,6 @@ files = ["src", "tests"]
 explicit_package_bases = true
 mypy_path = "src"
 strict = true
-follow_untyped_imports = true
 ignore_missing_imports = true
 python_version = "3.13"
 warn_unreachable = true
