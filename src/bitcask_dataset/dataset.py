@@ -105,13 +105,15 @@ class BitcaskDataset:
 
         shard_paths = _shard_paths(self.path / "shards")
         shard_sizes = np.asarray([path.stat().st_size for path in shard_paths], dtype=np.uint64)
+        shard_ends = np.cumsum(shard_sizes)
         expected_size = int(self._sizes.sum(dtype=np.uint64))
-        actual_size = int(shard_sizes.sum())
-        if actual_size != expected_size:
-            raise ValueError(f"shard data size is {actual_size}, expected {expected_size}")
+        # Shards past the indexed data are left over from an interrupted extend, which the next extend replaces.
+        shard_count = int(np.searchsorted(shard_ends, expected_size)) + (expected_size > 0)
+        if shard_count > len(shard_paths) or (shard_count and shard_ends[shard_count - 1] != expected_size):
+            raise ValueError(f"shard data does not match the {expected_size} bytes in the index")
 
-        self._shards = [_mmap_readonly(path) for path in shard_paths]
-        self._shard_ids, self._record_offsets = _build_locations(self._sizes, shard_sizes)
+        self._shards = [_mmap_readonly(path) for path in shard_paths[:shard_count]]
+        self._shard_ids, self._record_offsets = _build_locations(self._sizes, shard_sizes[:shard_count])
         self._keys: dict[bytes, int] = {}
         if self.keyed:
             self._keys = {bytes(self._key_at(index)): index for index in range(len(self))}

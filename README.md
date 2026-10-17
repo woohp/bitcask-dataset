@@ -98,6 +98,9 @@ value is limited to `2**32 - 1` bytes.
 
 ## Missing stuff
 
+An interrupted `extend` can leave extra shard files behind. They're ignored when
+opening and replaced by the next `extend`.
+
 No delete, overwrite, compaction, or concurrent writers. Also not
 actually an implementation of the Bitcask paper.
 

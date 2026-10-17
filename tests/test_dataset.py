@@ -102,6 +102,18 @@ def test_duplicate_keys_are_rejected_without_commit(tmp_path: Path) -> None:
     assert b"b" not in reopened
 
 
+def test_leftover_shard_from_interrupted_extend(tmp_path: Path) -> None:
+    dataset = BitcaskDataset(tmp_path / "data", keyed=True, compression=None)
+    dataset.extend([(b"a", b"1")])
+    (dataset.path / "shards" / "000001.bin").write_bytes(b"orphan")
+
+    reopened = BitcaskDataset(dataset.path, keyed=True, compression=None)
+    reopened.extend([(b"b", b"2")])
+
+    assert bytes(reopened[b"a"]) == b"1"
+    assert bytes(BitcaskDataset(dataset.path, keyed=True, compression=None)[b"b"]) == b"2"
+
+
 def test_invalid_existing_directory(tmp_path: Path) -> None:
     path = tmp_path / "data"
     path.mkdir()
