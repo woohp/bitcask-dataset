@@ -157,7 +157,6 @@ def test_lz4_high_compression(tmp_path: Path) -> None:
     stored_size = int(np.fromfile(dataset.path / "index.bin", dtype="<u4")[0])
     assert stored_size < len(value)
     assert dataset.at(0) == value
-    assert isinstance(dataset.at(0), bytes)
 
 
 def test_invalid_compression(tmp_path: Path) -> None:

@@ -22,7 +22,7 @@ ds.extend([
     (b"image/2", more_image_bytes),
 ])
 
-value = ds[b"image/1"]  # decompressed bytes
+value = ds[b"image/1"]  # read-only memoryview of the decompressed bytes
 
 # insertion order is available too
 value = ds.at(0)
@@ -62,8 +62,10 @@ keyless mode it takes values directly. It only creates new shards; it never adds
 to an old one. Records aren't split, so a record over `max_shard_size` gets a shard
 to itself.
 
-Compressed values come back as `bytes`. Pass `compression=None` to store values
-uncompressed and get zero-copy, read-only `memoryview`s instead. Keys are always
+Keys and values come back as read-only `memoryview`s, which `np.frombuffer` and
+`torch.frombuffer` can use without copying. Compressed values are views of freshly
+decompressed `bytes` (`value.obj`). Pass `compression=None` to store values
+uncompressed and read them straight from the mmap with zero copies. Keys are always
 uncompressed. `at` and `key_at` support negative indexes. Key lookup and `key_at`
 raise `TypeError` in keyless mode.
 
