@@ -233,6 +233,7 @@ def _extend_dataset(
             index_file.flush()
             os.fsync(index_file.fileno())
 
+        # Shard renames must be durable before the index rename, which commits the extend.
         for temporary, final in temporary_shards:
             os.replace(temporary, final)
         _fsync_directory(shards_path)
