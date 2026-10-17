@@ -211,9 +211,6 @@ def _validate_compression(compression: object) -> Compression:
     raise ValueError(f"unsupported compression: {compression!r}")
 
 
-# Manifest
-
-
 def _write_manifest(
     path: Path, *, keyed: bool, compression: Compression, shard_count: int
 ) -> None:
@@ -243,9 +240,6 @@ def _read_manifest(path: Path) -> tuple[bool, Compression, int]:
     if not valid:
         raise ValueError(f"invalid manifest: {manifest_path}")
     return keyed, _validate_compression(manifest["compression"]), shard_count
-
-
-# Writing
 
 
 def _records(
@@ -333,9 +327,6 @@ def _write_shards(
             written_path.unlink(missing_ok=True)
         raise
     return shard_count
-
-
-# Helpers
 
 
 def _shard_paths(path: Path, shard_id: int) -> tuple[Path, Path]:
