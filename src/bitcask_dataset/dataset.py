@@ -13,13 +13,11 @@ from lz4 import block
 DEFAULT_MAX_SHARD_SIZE = 1 << 30
 MAX_FIELD_SIZE = np.iinfo(np.uint32).max
 INDEX_DTYPE = np.dtype("<u4")
-EMPTY_VIEW = memoryview(b"")
 MANIFEST_NAME = "manifest.json"
 
 type Entry = tuple[Buffer, Buffer]
-type Record = tuple[memoryview, bytes | memoryview]
+type Record = tuple[bytes, bytes | memoryview]
 type Compression = Literal["lz4"] | None
-type Shard = mmap.mmap | memoryview
 
 
 class BitcaskDataset:
@@ -48,11 +46,14 @@ class BitcaskDataset:
     ) -> None:
         """Add values, or unique key/value pairs for a keyed dataset, as new shards.
 
-        Values are compressed in parallel, so entries must not be modified after they are yielded.
+        Keys and values must be C-contiguous buffers. Values are compressed in parallel, so their buffers
+        must not be modified after they are yielded.
         """
         if max_shard_size <= 0:
             raise ValueError("max_shard_size must be positive")
 
+        # Pick up shards committed through another handle, so they aren't overwritten.
+        self._add_shards(_read_manifest(self.path)[2])
         records = _records(entries, keyed=self.keyed, existing_keys=self._keys)
         workers = os.process_cpu_count() or 1
         with ThreadPoolExecutor(workers) as pool:
@@ -78,22 +79,24 @@ class BitcaskDataset:
     def __getitem__(self, key: Buffer) -> memoryview:
         if not self.keyed:
             raise TypeError("key lookup is disabled for this dataset")
-        normalized = _as_key(key)
-        try:
-            index = self._keys[normalized]
-        except KeyError:
-            raise KeyError(normalized) from None
-        return self._value_at(index)
+        return self.at(self._keys[_as_key(key)])
 
     def at(self, index: SupportsIndex) -> memoryview:
         """Return a value by insertion position."""
-        return self._value_at(index)
+        key_size = int(self._sizes[index, 0]) if self.keyed else 0
+        value_size = int(self._sizes[index, -1])
+        offset = int(self._record_offsets[index]) + key_size
+        value = self._shards[int(self._shard_ids[index])][offset : offset + value_size]
+        if self.compression == "lz4" and value_size:
+            return memoryview(block.decompress(value))
+        return value
 
     def key_at(self, index: SupportsIndex) -> memoryview:
         """Return a key by insertion position."""
         if not self.keyed:
             raise TypeError("keys are disabled for this dataset")
-        return self._key_at(index)
+        offset = int(self._record_offsets[index])
+        return self._shards[int(self._shard_ids[index])][offset : offset + int(self._sizes[index, 0])]
 
     def __getstate__(self) -> Path:
         return self.path
@@ -104,7 +107,7 @@ class BitcaskDataset:
 
     def _load(self) -> None:
         self.keyed, self.compression, shard_count = _read_manifest(self.path)
-        self._shards: list[Shard] = []
+        self._shards: list[memoryview] = []
         self._sizes = np.empty((0, 2 if self.keyed else 1), dtype=INDEX_DTYPE)
         self._shard_ids = np.empty(0, dtype=np.uint32)
         self._record_offsets = np.empty(0, dtype=np.uint64)
@@ -112,7 +115,10 @@ class BitcaskDataset:
         self._add_shards(shard_count)
 
     def _add_shards(self, shard_count: int) -> None:
+        if shard_count == len(self._shards):
+            return
         first_record = len(self)
+        shards: list[memoryview] = []
         sizes, shard_ids, record_offsets = [self._sizes], [self._shard_ids], [self._record_offsets]
         for shard_id in range(len(self._shards), shard_count):
             data_path, index_path = _shard_paths(self.path, shard_id)
@@ -122,42 +128,20 @@ class BitcaskDataset:
             if int(record_sizes.sum()) != len(shard):
                 raise ValueError(f"shard size does not match its index: {data_path}")
 
-            self._shards.append(shard)
+            shards.append(shard)
             sizes.append(shard_sizes)
             shard_ids.append(np.full(len(shard_sizes), shard_id, dtype=np.uint32))
             record_offsets.append(np.cumsum(record_sizes, dtype=np.uint64) - record_sizes)
 
+        self._shards += shards
         self._sizes = np.concatenate(sizes)
         self._shard_ids = np.concatenate(shard_ids)
         self._record_offsets = np.concatenate(record_offsets)
         if self.keyed:
             for index in range(first_record, len(self)):
-                self._keys[bytes(self._key_at(index))] = index
+                self._keys[bytes(self.key_at(index))] = index
             if len(self._keys) != len(self):
                 raise ValueError("duplicate keys in dataset")
-
-    def _key_at(self, index: SupportsIndex) -> memoryview:
-        key_size = int(self._sizes[index, 0])
-        if key_size == 0:
-            return EMPTY_VIEW
-
-        shard_id = int(self._shard_ids[index])
-        offset = int(self._record_offsets[index])
-        return memoryview(self._shards[shard_id])[offset : offset + key_size]
-
-    def _value_at(self, index: SupportsIndex) -> memoryview:
-        key_size = int(self._sizes[index, 0]) if self.keyed else 0
-        value_column = 1 if self.keyed else 0
-        value_size = int(self._sizes[index, value_column])
-        if value_size == 0:
-            return EMPTY_VIEW
-
-        shard_id = int(self._shard_ids[index])
-        offset = int(self._record_offsets[index]) + key_size
-        value = memoryview(self._shards[shard_id])[offset : offset + value_size]
-        if self.compression == "lz4":
-            return memoryview(block.decompress(value))
-        return value
 
 
 def _validate_compression(compression: object) -> Compression:
@@ -199,15 +183,17 @@ def _records(
         if not keyed:
             if not isinstance(entry, Buffer):
                 raise TypeError("keyless datasets require an iterable of buffers")
-            yield EMPTY_VIEW, _as_bytes_view(entry)
+            yield b"", _as_bytes_view(entry)
             continue
 
-        key, value = _entry_views(entry)
-        key_copy = bytes(key)
-        if key_copy in existing_keys or key_copy in new_keys:
-            raise ValueError(f"duplicate key: {key_copy!r}")
-        new_keys.add(key_copy)
-        yield key, value
+        if isinstance(entry, Buffer):
+            raise TypeError("keyed datasets require an iterable of (key, value) pairs")
+        raw_key, value = entry
+        key = _as_key(raw_key)
+        if key in existing_keys or key in new_keys:
+            raise ValueError(f"duplicate key: {key!r}")
+        new_keys.add(key)
+        yield key, _as_bytes_view(value)
 
 
 def _compress(record: Record) -> Record:
@@ -232,10 +218,10 @@ def _write_shards(
     shard_size = 0
     try:
         for key, value in records:
-            if key.nbytes > MAX_FIELD_SIZE or len(value) > MAX_FIELD_SIZE:
+            if len(key) > MAX_FIELD_SIZE or len(value) > MAX_FIELD_SIZE:
                 raise ValueError("keys and encoded values must fit in uint32")
 
-            record_size = key.nbytes + len(value)
+            record_size = len(key) + len(value)
             if files is None or (shard_size and shard_size + record_size > max_shard_size):
                 if files is not None:
                     _finish_files(files)
@@ -250,7 +236,7 @@ def _write_shards(
             data_file.write(value)
             shard_size += record_size
             if keyed:
-                index_file.write(struct.pack("<II", key.nbytes, len(value)))
+                index_file.write(struct.pack("<II", len(key), len(value)))
             else:
                 index_file.write(struct.pack("<I", len(value)))
 
@@ -269,18 +255,11 @@ def _shard_paths(path: Path, shard_id: int) -> tuple[Path, Path]:
     return path / f"{shard_id:06d}.bin", path / f"{shard_id:06d}.idx"
 
 
-def _mmap_readonly(path: Path) -> Shard:
+def _mmap_readonly(path: Path) -> memoryview:
     if path.stat().st_size == 0:
-        return EMPTY_VIEW
+        return memoryview(b"")
     with path.open("rb") as file:
-        return mmap.mmap(file.fileno(), length=0, access=mmap.ACCESS_READ)
-
-
-def _entry_views(entry: Buffer | Entry) -> tuple[memoryview, memoryview]:
-    if isinstance(entry, Buffer):
-        raise TypeError("keyed datasets require an iterable of (key, value) pairs")
-    key, value = entry
-    return _as_bytes_view(key), _as_bytes_view(value)
+        return memoryview(mmap.mmap(file.fileno(), length=0, access=mmap.ACCESS_READ))
 
 
 def _as_key(value: Buffer) -> bytes:

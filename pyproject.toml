@@ -1,7 +1,7 @@
 [project]
 name = "bitcask-dataset"
 version = "0.2.0"
-description = "A small, mmap-backed dataset for keyed byte blobs"
+description = "A small, mmap-backed dataset of byte blobs, optionally keyed"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [

@@ -1,3 +1,4 @@
+import mmap
 import pickle
 from pathlib import Path
 
@@ -120,6 +121,30 @@ def test_uncommitted_shard_is_ignored_and_replaced(tmp_path: Path) -> None:
     assert bytes(BitcaskDataset(dataset.path)[b"b"]) == b"2"
 
 
+def test_stale_handle_does_not_overwrite_committed_shards(tmp_path: Path) -> None:
+    path = tmp_path / "data"
+    BitcaskDataset.create(path, keyed=True)
+    first, second = BitcaskDataset(path), BitcaskDataset(path)
+    first.extend([(b"a", b"1")])
+    second.extend([(b"b", b"2")])
+
+    reopened = BitcaskDataset(path)
+    assert bytes(reopened[b"a"]) == b"1"
+    assert bytes(reopened[b"b"]) == b"2"
+
+
+def test_releasing_an_empty_value_does_not_affect_later_reads(tmp_path: Path) -> None:
+    dataset = BitcaskDataset.create(tmp_path / "data")
+    dataset.extend([b"", b""])
+
+    with dataset.at(0):
+        pass
+
+    assert bytes(dataset.at(1)) == b""
+    dataset.extend([b"value"])
+    assert bytes(dataset.at(2)) == b"value"
+
+
 def test_create_requires_empty_directory(tmp_path: Path) -> None:
     path = tmp_path / "data"
     path.mkdir()
@@ -153,7 +178,8 @@ def test_uncompressed_values_are_zero_copy(tmp_path: Path) -> None:
     dataset.extend([b"value"])
 
     value = dataset.at(0)
-    assert isinstance(value, memoryview)
+    assert isinstance(value.obj, mmap.mmap)
+    assert value.readonly
     assert bytes(value) == b"value"
 
 

@@ -52,7 +52,8 @@ ds.extend([image_bytes, more_image_bytes])
 value = ds.at(0)
 ```
 
-Keys and values can be anything with the buffer protocol.
+Keys and values can be any C-contiguous buffer (`bytes`, `bytearray`, a contiguous NumPy
+array, ...).
 
 ## API
 
@@ -109,8 +110,9 @@ Rewriting the manifest commits an `extend`, so shard files it doesn't list are
 leftovers from an interrupted `extend`; they're ignored and overwritten later. When
 copying a dataset, copy the manifest last.
 
-Keyed datasets copy keys into a Python dict at startup. Each key and stored value is
-limited to `2**32 - 1` bytes.
+Keyed datasets copy keys into a Python dict in each process that opens them (e.g. every
+DataLoader worker). Each key and stored value is limited to `2**32 - 1` bytes; with LZ4,
+uncompressed values are also limited to about 2 GiB, the LZ4 block limit.
 
 ## Missing stuff
 
