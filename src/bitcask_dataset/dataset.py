@@ -236,7 +236,9 @@ def _extend_dataset(
 
         for temporary, final in temporary_shards:
             os.replace(temporary, final)
+        _fsync_directory(shards_path)
         os.replace(index_temp, path / "index.bin")
+        _fsync_directory(path)
     except BaseException:
         if shard_file is not None:
             shard_file.close()
@@ -312,3 +314,11 @@ def _finish_file(file: BinaryIO) -> None:
     file.flush()
     os.fsync(file.fileno())
     file.close()
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
