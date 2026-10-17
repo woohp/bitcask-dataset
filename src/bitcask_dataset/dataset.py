@@ -134,11 +134,9 @@ class BitcaskDataset:
             return
         first_record = len(self)
         shards: list[memoryview] = []
-        sizes, shard_ids, record_offsets = (
-            [self._sizes],
-            [self._shard_ids],
-            [self._record_offsets],
-        )
+        sizes = [self._sizes]
+        shard_ids = [self._shard_ids]
+        record_offsets = [self._record_offsets]
         for shard_id in range(len(self._shards), shard_count):
             data_path, index_path = _shard_paths(self.path, shard_id)
             shard_sizes = np.fromfile(index_path, dtype=INDEX_DTYPE).reshape(
@@ -178,15 +176,10 @@ def _validate_compression(compression: object) -> Compression:
 def _write_manifest(
     path: Path, *, keyed: bool, compression: Compression, shard_count: int
 ) -> None:
+    manifest = {"keyed": keyed, "compression": compression, "shards": shard_count}
     temporary = path / f".{MANIFEST_NAME}.tmp"
     with temporary.open("wb") as file:
-        file.write(
-            json.dumps({
-                "keyed": keyed,
-                "compression": compression,
-                "shards": shard_count,
-            }).encode()
-        )
+        file.write(json.dumps(manifest).encode())
         _finish_files((file,))
     # New shard files must be durable before the manifest rename, which commits them.
     _fsync_directory(path)
