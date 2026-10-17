@@ -1,3 +1,15 @@
+"""An append-only, mmap-backed store of byte blobs.
+
+On disk, a dataset is a directory of numbered shards plus a manifest:
+
+    manifest.json   settings and the number of committed shards
+    000000.bin      records back to back: key || value || key || value ...
+    000000.idx      uint32 sizes per record: (key_size, value_size), or value_size
+
+Shards are never modified once committed, and rewriting the manifest commits an
+extend. Files the manifest doesn't count are leftovers and get overwritten.
+"""
+
 import json
 import mmap
 import os
@@ -11,12 +23,12 @@ import numpy as np
 from lz4 import block
 
 DEFAULT_MAX_SHARD_SIZE = 1 << 30
-MAX_FIELD_SIZE = np.iinfo(np.uint32).max
+MAX_FIELD_SIZE = np.iinfo(np.uint32).max  # index entries are uint32
 INDEX_DTYPE = np.dtype("<u4")
 MANIFEST_NAME = "manifest.json"
 
 type Entry = tuple[Buffer, Buffer]
-type Record = tuple[bytes, bytes | memoryview]
+type Record = tuple[bytes, bytes | memoryview]  # (key, stored value)
 type Compression = Literal["lz4"] | None
 
 
@@ -32,6 +44,7 @@ class BitcaskDataset:
         path.mkdir(parents=True, exist_ok=True)
         if any(path.iterdir()):
             raise FileExistsError(f"directory is not empty: {path}")
+
         _write_manifest(
             path,
             keyed=keyed,
@@ -61,6 +74,9 @@ class BitcaskDataset:
 
         # Pick up shards committed through another handle, so they aren't overwritten.
         self._add_shards(_read_manifest(self.path)[2])
+
+        # Validation and duplicate checks run lazily in this thread, as the shard
+        # writer pulls records through the compression pool.
         records = _records(entries, keyed=self.keyed, existing_keys=self._keys)
         workers = os.process_cpu_count() or 1
         with ThreadPoolExecutor(workers) as pool:
@@ -75,6 +91,8 @@ class BitcaskDataset:
                 first_shard_id=len(self._shards),
                 max_shard_size=max_shard_size,
             )
+
+        # Nothing is visible to readers until the manifest names the new shards.
         _write_manifest(
             self.path,
             keyed=self.keyed,
@@ -96,10 +114,13 @@ class BitcaskDataset:
 
     def at(self, index: SupportsIndex) -> memoryview:
         """Return a value by insertion position."""
+        # A record is key || value, so the value starts after the key.
         key_size = int(self._sizes[index, 0]) if self.keyed else 0
         value_size = int(self._sizes[index, -1])
         offset = int(self._record_offsets[index]) + key_size
         value = self._shards[int(self._shard_ids[index])][offset : offset + value_size]
+
+        # Empty values are stored empty, not as LZ4 blocks.
         if self.compression == "lz4" and value_size:
             return memoryview(block.decompress(value))
         return value
@@ -109,10 +130,10 @@ class BitcaskDataset:
         if not self.keyed:
             raise TypeError("keys are disabled for this dataset")
         offset = int(self._record_offsets[index])
-        return self._shards[int(self._shard_ids[index])][
-            offset : offset + int(self._sizes[index, 0])
-        ]
+        key_size = int(self._sizes[index, 0])
+        return self._shards[int(self._shard_ids[index])][offset : offset + key_size]
 
+    # Pickle only the path: mmaps can't be pickled, so workers reopen the dataset.
     def __getstate__(self) -> Path:
         return self.path
 
@@ -122,6 +143,11 @@ class BitcaskDataset:
 
     def _load(self) -> None:
         self.keyed, self.compression, shard_count = _read_manifest(self.path)
+
+        # One row per record, across all shards:
+        #   _sizes           (key_size, value_size), or (value_size,) when keyless
+        #   _shard_ids       which shard holds the record
+        #   _record_offsets  where the record starts in that shard
         self._shards: list[memoryview] = []
         self._sizes = np.empty((0, 2 if self.keyed else 1), dtype=INDEX_DTYPE)
         self._shard_ids = np.empty(0, dtype=np.uint32)
@@ -130,8 +156,10 @@ class BitcaskDataset:
         self._add_shards(shard_count)
 
     def _add_shards(self, shard_count: int) -> None:
+        """Map shards from the current count up to shard_count and index them."""
         if shard_count == len(self._shards):
             return
+
         shards: list[memoryview] = []
         sizes = [self._sizes]
         shard_ids = [self._shard_ids]
@@ -147,6 +175,8 @@ class BitcaskDataset:
             if int(record_sizes.sum()) != len(shard):
                 raise ValueError(f"shard size does not match its index: {data_path}")
 
+            # Records are packed with no headers, so each one starts where the
+            # previous one ended.
             offsets = np.cumsum(record_sizes, dtype=np.uint64) - record_sizes
             if self.keyed:
                 key_sizes = shard_sizes[:, 0].tolist()
@@ -154,6 +184,7 @@ class BitcaskDataset:
                     bytes(shard[offset : offset + key_size])
                     for offset, key_size in zip(offsets.tolist(), key_sizes)
                 ]
+
             shards.append(shard)
             sizes.append(shard_sizes)
             shard_ids.append(np.full(len(shard_sizes), shard_id, dtype=np.uint32))
@@ -164,6 +195,7 @@ class BitcaskDataset:
         keys = {key: index for index, key in enumerate(new_keys, len(self))}
         if len(keys) != len(new_keys) or not self._keys.keys().isdisjoint(keys):
             raise ValueError("duplicate keys in dataset")
+
         self._shards += shards
         self._sizes = np.concatenate(sizes)
         self._shard_ids = np.concatenate(shard_ids)
@@ -179,6 +211,9 @@ def _validate_compression(compression: object) -> Compression:
     raise ValueError(f"unsupported compression: {compression!r}")
 
 
+# Manifest
+
+
 def _write_manifest(
     path: Path, *, keyed: bool, compression: Compression, shard_count: int
 ) -> None:
@@ -187,6 +222,7 @@ def _write_manifest(
     with temporary.open("wb") as file:
         file.write(json.dumps(manifest).encode())
         _finish_files((file,))
+
     # New shard files must be durable before the manifest rename, which commits them.
     _fsync_directory(path)
     os.replace(temporary, path / MANIFEST_NAME)
@@ -196,18 +232,20 @@ def _write_manifest(
 def _read_manifest(path: Path) -> tuple[bool, Compression, int]:
     manifest_path = path / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text())
-    keyed, compression, shard_count = (
-        manifest["keyed"],
-        manifest["compression"],
-        manifest["shards"],
+    keyed = manifest["keyed"]
+    shard_count = manifest["shards"]
+
+    # The manifest is read from disk, so check it rather than trust it: a
+    # hand-edited "keyed": "false" would otherwise misread every record.
+    valid = (
+        isinstance(keyed, bool) and isinstance(shard_count, int) and shard_count >= 0
     )
-    if (
-        not isinstance(keyed, bool)
-        or not isinstance(shard_count, int)
-        or shard_count < 0
-    ):
+    if not valid:
         raise ValueError(f"invalid manifest: {manifest_path}")
-    return keyed, _validate_compression(compression), shard_count
+    return keyed, _validate_compression(manifest["compression"]), shard_count
+
+
+# Writing
 
 
 def _records(
@@ -227,6 +265,9 @@ def _records(
         if isinstance(entry, Buffer):
             raise TypeError("keyed datasets require an iterable of (key, value) pairs")
         raw_key, value = entry
+
+        # Copy the key now: it's both checked for duplicates and written later, and
+        # the caller's buffer may change in between.
         key = _as_key(raw_key)
         if key in existing_keys or key in new_keys:
             raise ValueError(f"duplicate key: {key!r}")
@@ -237,7 +278,7 @@ def _records(
 def _compress(record: Record) -> Record:
     key, value = record
     if not len(value):
-        return record
+        return record  # keep empty values empty; reads skip decompressing them
     return key, block.compress(value, mode="high_compression", store_size=True)
 
 
@@ -259,6 +300,8 @@ def _write_shards(
             if len(key) > MAX_FIELD_SIZE or len(value) > MAX_FIELD_SIZE:
                 raise ValueError("keys and encoded values must fit in uint32")
 
+            # Start a new shard when this record would overflow the current one.
+            # Records are never split, so an oversized record gets its own shard.
             record_size = len(key) + len(value)
             if files is None or (
                 shard_size and shard_size + record_size > max_shard_size
@@ -283,6 +326,7 @@ def _write_shards(
         if files is not None:
             _finish_files(files)
     except BaseException:
+        # Nothing here is committed yet, so clean up instead of leaving leftovers.
         for file in files or ():
             file.close()
         for written_path in written:
@@ -291,13 +335,16 @@ def _write_shards(
     return shard_count
 
 
+# Helpers
+
+
 def _shard_paths(path: Path, shard_id: int) -> tuple[Path, Path]:
     return path / f"{shard_id:06d}.bin", path / f"{shard_id:06d}.idx"
 
 
 def _mmap_readonly(path: Path) -> memoryview:
     if path.stat().st_size == 0:
-        return memoryview(b"")
+        return memoryview(b"")  # mmap can't map an empty file
     with path.open("rb") as file:
         return memoryview(mmap.mmap(file.fileno(), length=0, access=mmap.ACCESS_READ))
 
@@ -311,6 +358,8 @@ def _as_bytes_view(value: Buffer) -> memoryview:
         view = memoryview(value)
     except TypeError:
         raise TypeError("keys and values must support the buffer protocol") from None
+
+    # A flat byte view, so len() counts bytes; raises for non-C-contiguous buffers.
     return view.cast("B")
 
 
