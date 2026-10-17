@@ -3,7 +3,7 @@ name = "bitcask-dataset"
 version = "0.1.0"
 description = "A small, mmap-backed dataset for keyed byte blobs"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "lz4>=4.4.5",
     "numpy>=2.1",
@@ -13,7 +13,7 @@ keywords = ["dataset", "mmap", "machine-learning", "pytorch"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 
@@ -37,14 +37,14 @@ explicit_package_bases = true
 mypy_path = "src"
 strict = true
 ignore_missing_imports = true
-python_version = "3.13"
+python_version = "3.14"
 warn_unreachable = true
 
 [tool.ruff]
 indent-width = 4
 line-length = 120
 preview = true
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 ignore = ["B028", "B905", "C408", "E203", "FURB118", "SIM102", "SIM108"]
